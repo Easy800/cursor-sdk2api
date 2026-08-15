@@ -1,11 +1,13 @@
-import { createHash } from "node:crypto";
+import { createHash, scryptSync } from "node:crypto";
+
+const CREDENTIAL_FINGERPRINT_SALT = "cursor-sdk2api:credential-fingerprint:v1";
 
 export function sha256Hex(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
 export function credentialFingerprint(secret: string): string {
-  return sha256Hex(`cursor-sdk2api:v1:${secret}`);
+  return scryptSync(secret, CREDENTIAL_FINGERPRINT_SALT, 32).toString("hex");
 }
 
 export function stableStringify(value: unknown): string {
