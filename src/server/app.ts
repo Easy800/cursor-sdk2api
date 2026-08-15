@@ -1,0 +1,202 @@
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { authenticate } from "../auth/credentials.js";
+import { readAccount } from "../account/service.js";
+import type { Clock } from "../clock.js";
+import type { GatewayConfig } from "../config.js";
+import { RunCoordinator } from "../core/run-coordinator.js";
+import type { PumpBoundary } from "../core/event-pump.js";
+import { LineageStore } from "../core/lineage-store.js";
+import { SessionRegistry } from "../core/session-registry.js";
+import { GatewayError, invalidRequest, notFound, toPublicErrorBody } from "../errors.js";
+import { requestId as newRequestId } from "../ids.js";
+import type { Logger } from "../log.js";
+import { parseMessagesRequest } from "../protocols/anthropic/parse.js";
+import { writeSseError } from "../protocols/anthropic/sse.js";
+import type { SdkRuntime } from "../sdk/port.js";
+import { ModelCatalog } from "../sdk/catalog.js";
+import { headerValue, readJsonBody, requestPath, sendError, sendJson } from "./http-util.js";
+
+export interface App {
+  config: GatewayConfig;
+  registry: SessionRegistry;
+  coordinator: RunCoordinator;
+  catalog: ModelCatalog;
+  lineage: LineageStore;
+  sdk: SdkRuntime;
+  handler: (req: IncomingMessage, res: ServerResponse) => Promise<void>;
+  listen(): Server;
+  beginShutdown(): void;
+}
+
+export function createApp(input: {
+  config: GatewayConfig;
+  sdk: SdkRuntime;
+  clock: Clock;
+  logger: Logger;
+  workspaceDir: string;
+  beforeApplyBoundary?: (boundary: PumpBoundary) => Promise<void>;
+}): App {
+  const { config, sdk, clock, logger, workspaceDir, beforeApplyBoundary } = input;
+  const registry = new SessionRegistry(clock, config.instanceId, {
+    globalActiveRuns: config.globalActiveRuns,
+    perCredentialActiveRuns: config.perCredentialActiveRuns,
+    maxAwaitingSessions: config.maxAwaitingSessions,
+    sessionTtlMs: config.sessionTtlMs,
+    replayTtlMs: config.replayTtlMs,
+    runDeadlineMs: config.runDeadlineMs,
+  });
+  const lineage = new LineageStore(config.stateDir, clock);
+  const coordinator = new RunCoordinator({
+    config,
+    sdk,
+    registry,
+    clock,
+    logger,
+    workspaceDir,
+    lineage,
+    beforeApplyBoundary,
+  });
+  const catalog = new ModelCatalog(sdk, clock, config.catalogCacheMs);
+  let shuttingDown = false;
+  const sweepTimer = setInterval(() => {
+    try {
+      registry.sweep();
+      lineage.sweep();
+    } catch {
+      // sweep must not crash the process
+    }
+  }, Math.max(20, config.sweepIntervalMs));
+  sweepTimer.unref();
+
+  const handler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    const requestId = headerValue(req, "x-request-id") || newRequestId();
+    const path = requestPath(req);
+    const method = (req.method ?? "GET").toUpperCase();
+    try {
+      if (method === "GET" && path === "/health") {
+        sendJson(
+          res,
+          200,
+          {
+            status: shuttingDown ? "not_ready" : "ok",
+            service: "cursor-sdk2api",
+            version: config.version,
+            sdk_version:
+              sdk.sdkVersion && sdk.sdkVersion !== "unavailable" ? sdk.sdkVersion : config.sdkVersion,
+            network: {
+              proxy_configured: config.proxyConfigured,
+              agent_transport: config.agentTransport,
+              fetch_transport: config.fetchTransport,
+            },
+            runtime: "local",
+            instance_id: config.instanceId,
+            readiness: {
+              accepting_sessions: !shuttingDown && !registry.shuttingDown,
+              shutting_down: shuttingDown,
+            },
+            capabilities: {
+              ...config.capabilities,
+              agent_resume: config.capabilities.agent_resume,
+              pending_tool_restart_resume: false,
+              store_backend: config.capabilities.store_backend ?? "jsonl",
+            },
+            verification: {
+              live_smoke: false,
+              streaming: "sdk_onDelta",
+              thinking: "implemented_unverified_live",
+              images: "implemented_unverified_live",
+              parallel_tools: "implemented_unverified_live",
+            },
+          },
+          requestId,
+        );
+        return;
+      }
+
+      if (method === "GET" && path === "/v1/models") {
+        const auth = authenticate(req, config);
+        const listed = await catalog.list(auth.cursorApiKey, auth.fingerprint);
+        sendJson(
+          res,
+          listed.status === "unavailable" ? 200 : 200,
+          {
+            object: "list",
+            data: listed.models.map((model) => ({
+              id: model.id,
+              object: "model",
+              display_name: model.displayName,
+              description: model.description,
+              parameters: model.parameters,
+              variants: model.variants,
+            })),
+            status: listed.status,
+            ...(listed.reason ? { reason: listed.reason } : {}),
+            cache: listed.stale
+              ? { stale: true, reason: listed.reason ?? "refresh_failed" }
+              : { stale: false },
+          },
+          requestId,
+        );
+        return;
+      }
+
+      if (method === "GET" && path === "/v1/account") {
+        const auth = authenticate(req, config);
+        const account = await readAccount(sdk, auth.cursorApiKey);
+        sendJson(res, 200, account, requestId);
+        return;
+      }
+
+      if (method === "POST" && path === "/v1/messages") {
+        const auth = authenticate(req, config);
+        const body = await readJsonBody(req, config.maxBodyBytes);
+        if (body === undefined) throw invalidRequest("JSON body is required");
+        const parsed = parseMessagesRequest(body);
+        const sessionHint = headerValue(req, "x-cursor-session-id");
+        await coordinator.handleMessages(req, res, auth, parsed, requestId, sessionHint);
+        return;
+      }
+
+      throw notFound(`No route for ${method} ${path}`);
+    } catch (error) {
+      logger.warn(
+        {
+          request_id: requestId,
+          path,
+          method,
+          status: error instanceof GatewayError ? error.httpStatus : 502,
+          error_type: error instanceof GatewayError ? error.code : "cursor_upstream_error",
+        },
+        "request failed",
+      );
+      if (res.headersSent) {
+        writeSseError(res, toPublicErrorBody(error, requestId));
+        res.end();
+        return;
+      }
+      sendError(res, error, requestId);
+    }
+  };
+
+  return {
+    config,
+    registry,
+    coordinator,
+    catalog,
+    lineage,
+    sdk,
+    handler,
+    listen() {
+      const server = createServer((req, res) => {
+        void handler(req, res);
+      });
+      server.listen(config.port, config.host);
+      return server;
+    },
+    beginShutdown() {
+      shuttingDown = true;
+      clearInterval(sweepTimer);
+      registry.beginShutdown();
+    },
+  };
+}

@@ -1,0 +1,275 @@
+# cursor-sdk2api
+
+[简体中文](README.zh-CN.md)
+
+Independent MIT gateway that exposes the official Cursor TypeScript SDK (`@cursor/sdk`) as Anthropic-compatible HTTP APIs.
+
+This is **not** an official Cursor or Anysphere product. It does not reverse private Cursor transports, cookies, Desktop/CLI stores, or IDE sessions. The only Cursor execution engine is the published `@cursor/sdk` package. Users must supply a legally obtained Cursor API key and comply with Cursor Terms of Service.
+
+**v0.1 is Anthropic Messages-first.** OpenAI Chat Completions and Responses are planned for v0.2.
+
+## What v0.1 includes
+
+| Method | Path | Auth | Notes |
+|---|---|---|---|
+| `GET` | `/health` | none | Build, SDK version, readiness, **implemented** capability bits, network transport modes, and a separate `verification` object. Capability `true` means the gateway implements the path; it is not a live-model acceptance claim. `/health` never includes account data, keys, or proxy URLs. |
+| `GET` | `/v1/models` | required | Live `Cursor.models.list()` catalog with exact public IDs. Empty list plus an explicit reason when unavailable. |
+| `GET` | `/v1/account` | required | Identity from `Cursor.me()`. Spending and limits appear only when the official surface returns them. |
+| `POST` | `/v1/messages` | required | Anthropic Messages text, SSE, client tools, same-turn parallel tools, multi-round continuation, and in-process replay. |
+
+Default **API Compatibility Profile**:
+
+- Request `tools[]` map to SDK `local.customTools`.
+- Built-in allowlist is `["mcp"]` when client tools exist, otherwise `[]`.
+- Ambient Cursor capabilities (`shell`, `read`, `edit`, `task`, `webSearch`, `webFetch`) are denied.
+- `settingSources: []` and an empty workspace. The caller's repo is never implied.
+
+## Quick start
+
+Requires Node.js 22.19 or newer.
+
+```bash
+npm ci
+npm run build
+export AUTH_MODE=byok
+node dist/index.js
+```
+
+```bash
+curl -s localhost:8080/health
+curl -s localhost:8080/v1/models \
+  -H "Authorization: Bearer $CURSOR_API_KEY"
+curl -s localhost:8080/v1/messages \
+  -H "Authorization: Bearer $CURSOR_API_KEY" \
+  -H "content-type: application/json" \
+  -d '{"model":"composer-2.5","max_tokens":64,"messages":[{"role":"user","content":"hello"}]}'
+```
+
+Docker:
+
+```bash
+docker build -t cursor-sdk2api:local .
+docker run --rm -p 8080:8080 -e AUTH_MODE=byok cursor-sdk2api:local
+```
+
+`docker-compose.yml` is a single-service wrapper. It defaults `STATE_DIR` to `/data` on a named volume and does not ship secrets.
+
+Copy [`.env.example`](.env.example) for the full configuration surface. Never commit real keys.
+
+## Outbound proxy
+
+The official SDK does not automatically inherit the host proxy. When a supported proxy variable is set, the gateway routes **both** SDK data planes:
+
+- local Agent runs switch to HTTP/1.1 through `proxy-agent`
+- catalog and account fetches use Undici's environment proxy dispatcher
+
+`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` are accepted in uppercase or lowercase. Proxy URLs must use `http://` or `https://`. SOCKS and PAC fail closed, because the two SDK data planes cannot support them consistently. Direct (unproxied) Agent runs keep the official HTTP/2 transport.
+
+`/health` reports only `network.proxy_configured`, `network.agent_transport`, and `network.fetch_transport`. Proxy URLs and credentials are never returned.
+
+```bash
+export HTTPS_PROXY=http://127.0.0.1:7890
+export HTTP_PROXY=http://127.0.0.1:7890
+export NO_PROXY=127.0.0.1,localhost
+node dist/index.js
+```
+
+Inside Docker Desktop, a proxy running on the host is `host.docker.internal`, not `127.0.0.1` inside the container:
+
+```bash
+docker run --rm -p 8080:8080 \
+  -e AUTH_MODE=byok \
+  -e HTTPS_PROXY=http://host.docker.internal:7890 \
+  -e HTTP_PROXY=http://host.docker.internal:7890 \
+  -e NO_PROXY=127.0.0.1,localhost \
+  cursor-sdk2api:local
+```
+
+Do not put proxy userinfo in compose files or docs. Prefer a credential-free loopback URL, or keep credentials in a separately protected environment.
+
+## Authentication
+
+**BYOK (default).** Each request sends a Cursor API key as `Authorization: Bearer` or `x-api-key`. The process keeps the key in memory only and isolates sessions by an irreversible fingerprint.
+
+**Managed (optional).** The process holds `CURSOR_API_KEY`. Clients send a different `GATEWAY_ACCESS_KEY`. Health does not expose the managed Cursor identity.
+
+Forbidden: browser cookies, Desktop/CLI private stores, email/password login, refresh-token import, and putting keys in URLs, model names, or tool IDs.
+
+## API examples
+
+Non-stream Messages returns an assistant message plus `cursor_session_id` (`ses_...`). Use that value as `x-cursor-session-id` for a completed follow-up:
+
+```bash
+curl -s localhost:8080/v1/messages \
+  -H "Authorization: Bearer $CURSOR_API_KEY" \
+  -H "content-type: application/json" \
+  -H "x-cursor-session-id: ses_replace_me" \
+  -d '{"model":"composer-2.5","max_tokens":64,"messages":[{"role":"user","content":"continue"}]}'
+```
+
+Keep the public catalog model ID unchanged. For Grok 4.6 xhigh:
+
+```json
+{
+  "model": "grok-4.6",
+  "reasoning_effort": "xhigh",
+  "max_tokens": 64,
+  "messages": [{ "role": "user", "content": "hello" }]
+}
+```
+
+Advanced callers may pass validated official SDK pairs in `cursor_model_params`. An explicit parameter change on the same session is `409 cursor_session_conflict`.
+
+Tool continuation uses the same process-local Agent/Run. The latest user turn must contain only `tool_result` blocks:
+
+```json
+{
+  "model": "composer-2.5",
+  "max_tokens": 64,
+  "tools": [{ "name": "lookup", "input_schema": { "type": "object" } }],
+  "messages": [
+    { "role": "user", "content": "weather?" },
+    {
+      "role": "assistant",
+      "content": [{ "type": "tool_use", "id": "toolu_1", "name": "lookup", "input": { "q": "weather" } }]
+    },
+    {
+      "role": "user",
+      "content": [{ "type": "tool_result", "tool_use_id": "toolu_1", "content": "72F" }]
+    }
+  ]
+}
+```
+
+`max_tokens` is accepted so Claude Code-shaped requests parse. The SDK harness has no precise max-token enforcement, and the gateway does not emulate one. `temperature`, `top_p`, `stop_sequences`, and `tool_choice` are not rejected, but they are **not mapped** to `@cursor/sdk`.
+
+Errors:
+
+```json
+{
+  "type": "error",
+  "error": { "type": "invalid_request", "message": "..." },
+  "request_id": "req_..."
+}
+```
+
+Public error types: `invalid_request`, `authentication_error`, `forbidden`, `cursor_session_conflict`, `cursor_session_lost`, `rate_limited`, `cursor_empty_turn`, `cursor_upstream_error`, `cursor_timeout`.
+
+## Native tool loop
+
+The broker holds one SDK Agent/Run in process.
+
+1. The first request may return N `tool_use` blocks from the same assistant turn.
+2. The next request must send only `tool_result` blocks in the latest user turn.
+3. Results are matched by `tool_use_id`. Order is not authoritative.
+4. Wrong, missing, mixed-session, or duplicate-different IDs fail closed.
+5. Duplicate-same results replay the stored turn and do not resolve again.
+6. The HTTP sink is attached before deferred tool promises resolve.
+7. `run.stream()` has a single consumer.
+
+The default tool-batch debounce is 1500ms from the latest callback (`TOOL_BATCH_SETTLE_MS`). Live SDK probes observed Claude callbacks more than one second apart in one assistant turn; publishing on the first callback would hide later pending calls.
+
+Pending callbacks are ordinary in-memory Promises. They cannot be serialized across processes.
+
+## Usage and cache
+
+- Intermediate tool turns return zero usage with `usage_deferred: true`.
+- Cumulative SDK usage is confirmed once on the final turn via `run.wait()`.
+- Cache fields appear only when the SDK reports them. Missing fields are omitted, never invented.
+
+## State, resume, and multi-instance
+
+MVP owns live runs in the process that created them.
+
+- Blue/green and multi-instance deploys need connection draining and sticky ownership of a session.
+- After a process restart, unfinished tool continuations return `409 cursor_session_lost`.
+- The gateway will not create a new Agent to pretend the original pending Run was recovered.
+
+Completed follow-up with `x-cursor-session-id` can `Agent.resume` within `SESSION_TTL_MS` when credential, model, and explicit model parameters match. `pending_tool_restart_resume` stays `false` until a kill/restart acceptance proves exact callback recovery.
+
+`STATE_DIR` holds:
+
+- official JSONL SDK store at `$STATE_DIR/sdk-store/<credential-fingerprint>`
+- owner-only lineage metadata at `$STATE_DIR/lineage` (`0700` / `0600`)
+
+Host/dev default is `$TMPDIR/cursor-sdk2api/state`. The image and compose default is `/data`. Lineage stores resume metadata only (session id, SDK agent id, fingerprint, model, explicit params, state, pending tool ids, optional result digest, timestamps). It does not store API keys, prompts, or tool payloads. Assistant replay bodies are not persisted, so duplicate-same after restart is also `cursor_session_lost`.
+
+BYOK credentials share process capacity limits, but official SDK stores and empty workspaces are partitioned by credential fingerprint. That is process-local tenant isolation, not a claim of hardened hostile multi-tenant hosting.
+
+Development defaults: 4 global active runs, 2 per credential, 30 minute session TTL, 10 minute replay TTL, 60 minute run deadline. Active-run limits apply to create, completed follow-up, and persisted resume. Drain still accepts awaiting `tool_result`.
+
+## Status and evidence
+
+v0.1 implements Messages text/SSE, client customTools/MCP, same-turn parallel tools, multi-round continuation, in-process replay, tenant/model isolation, completed Agent resume, and fail-closed pending restart.
+
+A sanitized, non-secret acceptance summary is in [`docs/evidence/2026-08-15-live-smoke.md`](docs/evidence/2026-08-15-live-smoke.md). That receipt is a dated local sample, not a guarantee for every credential, region, or image:
+
+- Host Claude Sonnet 4.6 and Fable 5 passed the required proxied matrix, including parallel tools and a Claude Code-shaped Fable request.
+- Composer 2.5 passed the required host matrix, including same-turn parallel selection.
+- Grok 4.6 xhigh passed text, SSE, single tool, multi-round, replay, pending-restart fail-closed, and completed resume. Same-turn parallel selection is **model-nondeterministic** in that sample and is **not** a guaranteed behavior.
+- A Node 22 container proved both SDK data planes honor a configured HTTP(S) proxy, and fail when that proxy is unreachable. Fable container parallel/upstream success was **not** perfectly repeatable and is **not** marketed as a fully green container matrix.
+- Runtime `/health.verification.live_smoke` stays `false`. A binary cannot infer that a different deployment inherited this receipt.
+
+Thinking and image blocks are implemented and contract-tested. Live thinking/image granularity remains a separate model gate.
+
+## Known limitations
+
+- Official `@cursor/sdk` is required at runtime. Its own license and Cursor Terms apply. See [NOTICE.md](NOTICE.md).
+- Production `npm audit --omit=dev` (2026-08-15) reports 3 transitive findings in the SDK tree: `undici` (high) and `@connectrpc/connect-node` / `@cursor/sdk` (moderate). `fixAvailable` is false. Do not run a destructive `npm audit fix`.
+- `Cursor.me()` does not currently expose spending or remaining quota; `/v1/account` is therefore `partial` unless a future official surface returns those fields.
+- Hard crash recovery of an in-flight tool turn is `cursor_session_lost`, not HA.
+- Credentialed live-model tests are opt-in and are not part of default CI.
+
+Not in v0.1:
+
+- OpenAI Chat Completions and Responses (planned [v0.2](docs/DELIVERY_PLAN.md))
+- Cursor Agent Profile (`/v1/agents`, native shell/edit, plan mode)
+- distributed session ownership / Redis / Postgres
+
+## Development
+
+```bash
+npm ci
+npm run typecheck
+npm test
+npm run build
+```
+
+Tests inject a deterministic fake SDK. They never read real Cursor credentials. GitHub Actions CI in [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs typecheck, tests, build, and `docker build`.
+
+Opt-in live matrix (not default CI, not run by `npm test`):
+
+```bash
+npm run build
+CURSOR_LIVE_SMOKE=1 CURSOR_API_KEY=... npm run live:smoke
+```
+
+The runner binds loopback only, writes a redacted receipt under temp, and never logs keys, prompts, or tool payloads. See [`scripts/live-smoke/README.md`](scripts/live-smoke/README.md).
+
+## Docs
+
+| Doc | Contents |
+|---|---|
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Run ownership, proxy transports, restart semantics |
+| [docs/PROTOCOL_COMPATIBILITY.md](docs/PROTOCOL_COMPATIBILITY.md) | Endpoint and block support matrix |
+| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | Local, Docker, drain, and upgrade |
+| [docs/SECURITY.md](docs/SECURITY.md) | Credentials, logging, and threat notes |
+| [docs/NEW_API_INTEGRATION.md](docs/NEW_API_INTEGRATION.md) | Using the gateway as a generic Anthropic upstream |
+| [docs/DELIVERY_PLAN.md](docs/DELIVERY_PLAN.md) | Public roadmap and later phases |
+| [CHANGELOG.md](CHANGELOG.md) | v0.1 notes |
+
+Until a published image digest exists, point Claude Code, OpenCode, or a generic Anthropic client at `http://<gateway-host>:8080` with the Cursor key (BYOK) or gateway access key (managed). Do not embed `@cursor/sdk` inside another gateway process.
+
+## Security
+
+- Do not enable payload logging on a shared host.
+- Do not set `DEBUG=*` or `DEBUG=proxy-agent` on a shared host; third-party transport logs can print proxy configuration.
+- Treat `STATE_DIR` as owner-only sensitive state. The official SDK store may contain conversation and checkpoint data; this gateway does not audit those files.
+- Public Internet deployment still requires TLS, access controls, encrypted state, monitoring, and an explicit operator threat model.
+- Default logs may include request id, model id, stream flag, status, pending count, and final numeric usage. They must not include keys, cookies, prompts, thinking, tool schemas, tool arguments, or tool results.
+
+## License and contributing
+
+MIT. See [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md).
+
+Contributions: [CONTRIBUTING.md](CONTRIBUTING.md). Deterministic contract tests first; isolated Docker build second; live smoke only with an explicitly supplied test credential.

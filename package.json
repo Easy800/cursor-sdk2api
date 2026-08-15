@@ -1,0 +1,46 @@
+{
+  "name": "cursor-sdk2api",
+  "version": "0.1.0",
+  "description": "Independent MIT gateway that exposes official @cursor/sdk as Anthropic-compatible HTTP APIs.",
+  "license": "MIT",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "bin": {
+    "cursor-sdk2api": "./dist/index.js"
+  },
+  "main": "./dist/index.js",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "NOTICE.md",
+    "README.md",
+    "README.zh-CN.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "start": "node dist/index.js",
+    "dev": "node --import tsx src/index.ts",
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "live:smoke": "tsx scripts/live-smoke/run.ts"
+  },
+  "dependencies": {
+    "@cursor/sdk": "1.0.28",
+    "proxy-agent": "8.0.2",
+    "undici": "8.10.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.18.12",
+    "tsx": "4.20.6",
+    "typescript": "5.9.2",
+    "vitest": "3.2.4"
+  }
+}

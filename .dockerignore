@@ -1,0 +1,12 @@
+node_modules
+dist
+.git
+.github
+.grok-companion
+coverage
+.env*
+!.env.example
+tests
+docs
+*.log
+tmp

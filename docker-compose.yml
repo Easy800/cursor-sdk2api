@@ -1,0 +1,21 @@
+services:
+  gateway:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      AUTH_MODE: byok
+      HOST: 0.0.0.0
+      PORT: 8080
+      STATE_DIR: /data
+      # A host proxy on Docker Desktop is normally reached through
+      # host.docker.internal, not 127.0.0.1 inside the container.
+      # HTTPS_PROXY: http://host.docker.internal:7890
+      # HTTP_PROXY: http://host.docker.internal:7890
+      # NO_PROXY: 127.0.0.1,localhost
+    volumes:
+      - cursor-sdk2api-data:/data
+    # Supply keys at run time. Do not put real secrets in this file.
+
+volumes:
+  cursor-sdk2api-data:
