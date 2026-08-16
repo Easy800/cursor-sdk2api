@@ -1,16 +1,18 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { authenticate } from "../auth/credentials.js";
 import { readAccount } from "../account/service.js";
+import { CursorAccountFileStore } from "../account/file-store.js";
 import type { Clock } from "../clock.js";
 import type { GatewayConfig } from "../config.js";
 import { RunCoordinator } from "../core/run-coordinator.js";
 import type { PumpBoundary } from "../core/event-pump.js";
 import { LineageStore } from "../core/lineage-store.js";
 import { SessionRegistry } from "../core/session-registry.js";
-import { GatewayError, invalidRequest, notFound, toPublicErrorBody } from "../errors.js";
+import { GatewayError, invalidRequest, notFound, redactSecrets, toPublicErrorBody } from "../errors.js";
 import { requestId as newRequestId } from "../ids.js";
 import type { Logger } from "../log.js";
 import { parseMessagesRequest } from "../protocols/anthropic/parse.js";
+import { estimateAnthropicInputTokens } from "../protocols/anthropic/count-tokens.js";
 import { writeSseError } from "../protocols/anthropic/sse.js";
 import { parseChatCompletionsRequest } from "../protocols/openai-chat/parse.js";
 import { writeChatStreamError } from "../protocols/openai-chat/sse.js";
@@ -29,6 +31,7 @@ export interface App {
   coordinator: RunCoordinator;
   catalog: ModelCatalog;
   lineage: LineageStore;
+  accounts: CursorAccountFileStore;
   sdk: SdkRuntime;
   handler: (req: IncomingMessage, res: ServerResponse) => Promise<void>;
   listen(): Server;
@@ -64,6 +67,7 @@ export function createApp(input: {
     beforeApplyBoundary,
   });
   const catalog = new ModelCatalog(sdk, clock, config.catalogCacheMs);
+  const accounts = new CursorAccountFileStore(config.stateDir, config.managedCursorKey);
   let shuttingDown = false;
   const sweepTimer = setInterval(() => {
     try {
@@ -111,7 +115,7 @@ export function createApp(input: {
             capabilities: {
               ...config.capabilities,
               agent_resume: config.capabilities.agent_resume,
-              pending_tool_restart_resume: false,
+              pending_tool_restart_resume: config.capabilities.pending_tool_restart_resume,
               store_backend: config.capabilities.store_backend ?? "jsonl",
             },
             verification: {
@@ -127,6 +131,52 @@ export function createApp(input: {
           requestId,
         );
         return;
+      }
+
+      if (path === "/v0/management/accounts") {
+        if (method === "GET") {
+          sendJson(
+            res,
+            200,
+            {
+              accounts: accounts.list().map((account) => ({
+                id: account.id,
+                api_key: account.apiKey,
+                key_hint: account.keyHint,
+                added_at: account.addedAt,
+              })),
+            },
+            requestId,
+          );
+          return;
+        }
+        if (method === "POST") {
+          const body = await readJsonBody(req, config.maxBodyBytes) as { api_key?: unknown } | undefined;
+          const apiKey = typeof body?.api_key === "string" ? body.api_key.trim() : "";
+          if (!apiKey) throw invalidRequest("api_key is required");
+          const account = accounts.add(apiKey);
+          sendJson(
+            res,
+            201,
+            {
+              account: {
+                id: account.id,
+                api_key: account.apiKey,
+                key_hint: account.keyHint,
+                added_at: account.addedAt,
+              },
+            },
+            requestId,
+          );
+          return;
+        }
+        if (method === "DELETE") {
+          const id = new URL(req.url ?? "/", "http://localhost").searchParams.get("id")?.trim() ?? "";
+          if (!id) throw invalidRequest("id is required");
+          if (!accounts.remove(id)) throw notFound("Persistent account was not found");
+          sendJson(res, 200, { deleted: true }, requestId);
+          return;
+        }
       }
 
       if (method === "GET" && path === "/v1/models") {
@@ -160,6 +210,16 @@ export function createApp(input: {
         const auth = authenticate(req, config);
         const account = await readAccount(sdk, auth.cursorApiKey);
         sendJson(res, 200, account, requestId);
+        return;
+      }
+
+      if (method === "POST" && path === "/v1/messages/count_tokens") {
+        authenticate(req, config);
+        const body = await readJsonBody(req, config.maxBodyBytes);
+        if (body === undefined) throw invalidRequest("JSON body is required");
+        const parsed = parseMessagesRequest(body);
+        res.setHeader("x-cursor-sdk2api-token-count", "estimated");
+        sendJson(res, 200, { input_tokens: estimateAnthropicInputTokens(body, parsed) }, requestId);
         return;
       }
 
@@ -218,6 +278,7 @@ export function createApp(input: {
           method,
           status: error instanceof GatewayError ? error.httpStatus : 502,
           error_type: error instanceof GatewayError ? error.code : "cursor_upstream_error",
+          error: redactSecrets(error instanceof Error ? error.message : String(error ?? "Unexpected error")),
         },
         "request failed",
       );
@@ -240,6 +301,7 @@ export function createApp(input: {
     coordinator,
     catalog,
     lineage,
+    accounts,
     sdk,
     handler,
     listen() {
