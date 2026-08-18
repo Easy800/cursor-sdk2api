@@ -1,4 +1,5 @@
 import { invalidRequest } from "../../errors.js";
+import { stableStringify } from "../../digest.js";
 import { collectImages, parseContinuation, parseModelParams } from "../anthropic/parse.js";
 import type {
   AnthropicContentBlock,
@@ -13,7 +14,7 @@ export function parseResponsesRequest(body: unknown): ParsedResponses {
     throw invalidRequest("JSON object body is required");
   }
   const raw = body as Record<string, unknown>;
-  rejectUnsupported(raw);
+  const formatDirective = rejectUnsupported(raw);
   if (typeof raw.model !== "string" || !raw.model.trim()) {
     throw invalidRequest("model is required");
   }
@@ -38,16 +39,17 @@ export function parseResponsesRequest(body: unknown): ParsedResponses {
 
   const parsedInput = parseInput(raw.input);
   systemParts.push(...parsedInput.systemParts);
+  if (formatDirective) systemParts.push(formatDirective);
   const messages = parsedInput.messages;
-  const tools = Array.isArray(raw.tools) ? raw.tools.map(parseResponsesTool) : [];
-  const names = new Set<string>();
-  for (const tool of tools) {
-    if (names.has(tool.name)) throw invalidRequest(`duplicate tool name: ${tool.name}`);
-    names.add(tool.name);
-  }
+  const tools = mergeResponseTools(
+    Array.isArray(raw.tools) ? raw.tools.map(parseResponsesTool) : [],
+    parsedInput.additionalTools,
+  );
+  const names = new Set(tools.flatMap((tool) => [tool.name, tool.sdk_name ?? tool.name]));
 
   const lastUser = [...messages].reverse().find((message) => message.role === "user");
-  const continuation = lastUser ? parseContinuation(lastUser) : undefined;
+  const terminal = messages.at(-1);
+  const continuation = terminal?.role === "user" ? parseContinuation(terminal) : undefined;
   const images = collectImages(messages);
   const toolChoice = parseOpenAiToolChoice(
     raw.tool_choice,
@@ -72,7 +74,7 @@ export function parseResponsesRequest(body: unknown): ParsedResponses {
   };
 }
 
-function rejectUnsupported(raw: Record<string, unknown>): void {
+function rejectUnsupported(raw: Record<string, unknown>): string | undefined {
   if (raw.previous_response_id != null && raw.previous_response_id !== "") {
     throw invalidRequest(
       "previous_response_id is not supported; use function_call_output.call_id to resume a pending tool turn, or x-cursor-session-id for a completed follow-up",
@@ -107,11 +109,28 @@ function rejectUnsupported(raw: Record<string, unknown>): void {
     const format = (text as { format?: unknown }).format;
     if (format !== undefined) {
       const type = format && typeof format === "object" ? (format as { type?: unknown }).type : undefined;
-      if (type !== "text") {
-        throw invalidRequest('text.format must be omitted or {type:"text"}');
+      if (type === "text") return undefined;
+      if (type !== "json_schema") {
+        throw invalidRequest('text.format.type must be "text" or "json_schema"');
       }
+      const schema = format as Record<string, unknown>;
+      if (typeof schema.name !== "string" || !/^[a-zA-Z0-9_-]{1,64}$/.test(schema.name)) {
+        throw invalidRequest("text.format json_schema requires a valid name");
+      }
+      if (!schema.schema || typeof schema.schema !== "object" || Array.isArray(schema.schema)) {
+        throw invalidRequest("text.format json_schema requires a schema object");
+      }
+      return [
+        "OUTPUT FORMAT:",
+        `Return only valid JSON matching schema ${schema.name}. Do not use Markdown fences or add prose outside the JSON value.`,
+        `JSON Schema: ${stableStringify(schema.schema)}`,
+        schema.strict === true
+          ? "The client requested strict schema adherence. The Cursor SDK has no native structured-output API, so follow this contract exactly."
+          : "Follow this schema as closely as possible.",
+      ].join("\n");
     }
   }
+  return undefined;
 }
 
 function parseInstructions(value: unknown): string {
@@ -136,6 +155,22 @@ function parseInstructions(value: unknown): string {
 function parseResponsesTool(value: unknown): AnthropicTool {
   if (!value || typeof value !== "object") throw invalidRequest("tool must be an object");
   const raw = value as Record<string, unknown>;
+  if (raw.type === "custom") {
+    if (typeof raw.name !== "string" || !/^[a-zA-Z0-9_-]{1,128}$/.test(raw.name)) {
+      throw invalidRequest("custom tool name must match [a-zA-Z0-9_-]{1,128}");
+    }
+    return {
+      name: raw.name,
+      description: typeof raw.description === "string" ? raw.description : undefined,
+      input_schema: {
+        type: "object",
+        properties: { input: { type: "string", description: "Freeform custom tool input" } },
+        required: ["input"],
+        additionalProperties: false,
+      },
+      tool_kind: "custom",
+    };
+  }
   if (raw.type !== "function") {
     throw invalidRequest(
       `unsupported Responses tool type: ${String(raw.type)}; hosted tools (web_search, file_search, computer, shell, apply_patch) are not implemented`,
@@ -160,19 +195,25 @@ function parseResponsesTool(value: unknown): AnthropicTool {
       parameters && typeof parameters === "object"
         ? (parameters as Record<string, unknown>)
         : { type: "object", properties: {} },
+    tool_kind: "function",
   };
 }
 
-function parseInput(input: unknown): { messages: AnthropicMessage[]; systemParts: string[] } {
+function parseInput(input: unknown): {
+  messages: AnthropicMessage[];
+  systemParts: string[];
+  additionalTools: AnthropicTool[];
+} {
   if (typeof input === "string") {
     if (!input.trim()) throw invalidRequest("input must be a non-empty string or item array");
-    return { messages: [{ role: "user", content: input }], systemParts: [] };
+    return { messages: [{ role: "user", content: input }], systemParts: [], additionalTools: [] };
   }
   if (!Array.isArray(input) || input.length === 0) {
     throw invalidRequest("input must be a non-empty string or item array");
   }
   const messages: AnthropicMessage[] = [];
   const systemParts: string[] = [];
+  const additionalTools: AnthropicTool[] = [];
   let pendingResults: Extract<AnthropicContentBlock, { type: "tool_result" }>[] = [];
   let pendingAssistant: AnthropicContentBlock[] = [];
 
@@ -192,7 +233,15 @@ function parseInput(input: unknown): { messages: AnthropicMessage[]; systemParts
     const raw = item as Record<string, unknown>;
     const type = typeof raw.type === "string" ? raw.type : inferItemType(raw);
 
-    if (type === "function_call_output") {
+    if (type === "additional_tools") {
+      if (!Array.isArray(raw.tools)) {
+        throw invalidRequest("additional_tools.tools must be an array");
+      }
+      additionalTools.push(...raw.tools.flatMap(parseAdditionalTool));
+      continue;
+    }
+
+    if (type === "function_call_output" || type === "custom_tool_call_output") {
       flushAssistant();
       pendingResults.push(parseFunctionCallOutput(raw));
       continue;
@@ -200,7 +249,7 @@ function parseInput(input: unknown): { messages: AnthropicMessage[]; systemParts
 
     flushResults();
 
-    if (type === "function_call") {
+    if (type === "function_call" || type === "custom_tool_call") {
       pendingAssistant.push(parseFunctionCall(raw));
       continue;
     }
@@ -228,7 +277,72 @@ function parseInput(input: unknown): { messages: AnthropicMessage[]; systemParts
   if (messages.length === 0) {
     throw invalidRequest("input must include a user message or function_call_output");
   }
-  return { messages, systemParts };
+  return { messages, systemParts, additionalTools };
+}
+
+function parseAdditionalTool(value: unknown): AnthropicTool[] {
+  if (!value || typeof value !== "object") {
+    throw invalidRequest("each additional_tools entry must be an object");
+  }
+  const raw = value as Record<string, unknown>;
+  if (raw.type === "function" || raw.type === "custom") return [parseResponsesTool(raw)];
+  if (raw.type === "namespace") return parseNamespaceTools(raw);
+  throw invalidRequest(
+    `unsupported additional_tools type: ${String(raw.type)}; only client-executed function, custom, and namespace tools are supported`,
+  );
+}
+
+function parseNamespaceTools(raw: Record<string, unknown>): AnthropicTool[] {
+  if (typeof raw.name !== "string" || !/^[a-zA-Z0-9_-]{1,96}$/.test(raw.name)) {
+    throw invalidRequest("namespace tool requires a valid name");
+  }
+  if (!Array.isArray(raw.tools) || raw.tools.length === 0) {
+    throw invalidRequest("namespace tool requires a non-empty tools array");
+  }
+  const namespace = raw.name;
+  return raw.tools.map((child) => {
+    const parsed = parseResponsesTool(child);
+    const sdkName = qualifyNamespaceTool(namespace, parsed.name);
+    if (!/^[a-zA-Z0-9_-]{1,128}$/.test(sdkName)) {
+      throw invalidRequest(`qualified namespace tool name is invalid: ${sdkName}`);
+    }
+    return { ...parsed, sdk_name: sdkName, namespace };
+  });
+}
+
+function qualifyNamespaceTool(namespace: string, name: string): string {
+  if (name.startsWith("mcp__") || name.startsWith(`${namespace}__`)) return name;
+  return `${namespace}__${name}`;
+}
+
+function mergeResponseTools(primary: AnthropicTool[], additional: AnthropicTool[]): AnthropicTool[] {
+  const merged = new Map<string, AnthropicTool>();
+  for (const tool of primary) {
+    const key = tool.sdk_name ?? tool.name;
+    const existing = merged.get(key);
+    if (!existing) {
+      merged.set(key, tool);
+      continue;
+    }
+    if (stableStringify(existing) !== stableStringify(tool)) {
+      throw invalidRequest(`conflicting duplicate tool name: ${key}`);
+    }
+  }
+  const seenAdditional = new Map<string, AnthropicTool>();
+  for (const tool of additional) {
+    const key = tool.sdk_name ?? tool.name;
+    // Responses Lite may repeat a top-level declaration inside
+    // additional_tools using a different representation (function/custom).
+    // The top-level catalog is authoritative, matching Codex gateway behavior.
+    if (merged.has(key)) continue;
+    const existing = seenAdditional.get(key);
+    if (existing && stableStringify(existing) !== stableStringify(tool)) {
+      throw invalidRequest(`conflicting duplicate additional tool name: ${key}`);
+    }
+    if (!existing) seenAdditional.set(key, tool);
+  }
+  for (const [key, tool] of seenAdditional) merged.set(key, tool);
+  return [...merged.values()];
 }
 
 function pushMessageItem(
@@ -264,7 +378,7 @@ function parseFunctionCallOutput(
   raw: Record<string, unknown>,
 ): Extract<AnthropicContentBlock, { type: "tool_result" }> {
   if (typeof raw.call_id !== "string" || !raw.call_id.trim()) {
-    throw invalidRequest("function_call_output must include call_id");
+    throw invalidRequest("tool call output must include call_id");
   }
   return {
     type: "tool_result",
@@ -298,16 +412,20 @@ function stringifyResponsesToolOutput(output: unknown): string {
 
 function parseFunctionCall(raw: Record<string, unknown>): Extract<AnthropicContentBlock, { type: "tool_use" }> {
   if (typeof raw.call_id !== "string" || !raw.call_id.trim()) {
-    throw invalidRequest("function_call must include call_id");
+    throw invalidRequest("tool call must include call_id");
   }
   if (typeof raw.name !== "string" || !raw.name) {
-    throw invalidRequest("function_call must include name");
+    throw invalidRequest("tool call must include name");
   }
   return {
     type: "tool_use",
     id: raw.call_id,
     name: raw.name,
-    input: parseToolArguments(raw.arguments),
+    input: raw.type === "custom_tool_call"
+      ? { input: typeof raw.input === "string" ? raw.input : "" }
+      : parseToolArguments(raw.arguments),
+    ...(raw.type === "custom_tool_call" ? { tool_kind: "custom" as const } : {}),
+    ...(typeof raw.namespace === "string" && raw.namespace ? { namespace: raw.namespace } : {}),
   };
 }
 

@@ -4,6 +4,7 @@ import { sendJson, sendOpenAIError } from "../../server/http-util.js";
 import type { AnthropicContentBlock, AssistantTurn } from "../anthropic/types.js";
 import {
   encodeFunctionCallItem,
+  encodeCustomToolCallItem,
   encodeMessageItem,
   encodeReasoningItem,
   encodeResponse,
@@ -106,7 +107,10 @@ class ResponsesTurnWriter implements TurnWriter {
     const tools = turn.blocks.filter(
       (block): block is Extract<AnthropicContentBlock, { type: "tool_use" }> => block.type === "tool_use",
     );
-    for (const block of tools) this.emitFunctionCall(block);
+    for (const block of tools) {
+      if (block.tool_kind === "custom") this.emitCustomToolCall(block);
+      else this.emitFunctionCall(block);
+    }
   }
 
   private ensureReasoning(): StreamItem {
@@ -211,10 +215,39 @@ class ResponsesTurnWriter implements TurnWriter {
       output_index: outputIndex,
       name: block.name,
       arguments: argumentsJson,
+      ...(block.namespace ? { namespace: block.namespace } : {}),
     });
     this.emit("response.output_item.done", {
       output_index: outputIndex,
       item: encodeFunctionCallItem(block),
+    });
+  }
+
+  private emitCustomToolCall(block: Extract<AnthropicContentBlock, { type: "tool_use" }>): void {
+    const outputIndex = this.nextOutputIndex++;
+    const itemId = functionCallItemId(block.id);
+    const record = block.input && typeof block.input === "object" ? block.input as Record<string, unknown> : {};
+    const input = typeof record.input === "string" ? record.input : JSON.stringify(block.input ?? "");
+    this.emit("response.output_item.added", {
+      output_index: outputIndex,
+      item: { ...encodeCustomToolCallItem(block, "in_progress"), input: "" },
+    });
+    if (input) {
+      this.emit("response.custom_tool_call_input.delta", {
+        item_id: itemId,
+        output_index: outputIndex,
+        delta: input,
+      });
+    }
+    this.emit("response.custom_tool_call_input.done", {
+      item_id: itemId,
+      output_index: outputIndex,
+      input,
+      ...(block.namespace ? { namespace: block.namespace } : {}),
+    });
+    this.emit("response.output_item.done", {
+      output_index: outputIndex,
+      item: encodeCustomToolCallItem(block),
     });
   }
 

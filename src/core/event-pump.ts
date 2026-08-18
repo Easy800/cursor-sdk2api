@@ -238,6 +238,8 @@ export class EventPump {
         id: call.toolUseId,
         name: call.name,
         input: call.input,
+        ...(call.toolKind ? { tool_kind: call.toolKind } : {}),
+        ...(call.namespace ? { namespace: call.namespace } : {}),
       });
     }
     this.publish({

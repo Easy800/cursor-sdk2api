@@ -43,13 +43,20 @@ export function parseOpenAiToolChoice(
     throw invalidRequest(`${protocol} tool_choice must be auto, required, or a named function`);
   }
   const raw = value as Record<string, unknown>;
-  if (raw.type !== "function") {
-    throw invalidRequest(`${protocol} tool_choice object must have type=function`);
+  if (raw.type !== "function" && !(protocol === "Responses" && raw.type === "custom")) {
+    throw invalidRequest(`${protocol} tool_choice object must have type=function${protocol === "Responses" ? " or custom" : ""}`);
   }
   const nested = raw.function && typeof raw.function === "object"
     ? (raw.function as Record<string, unknown>)
     : undefined;
-  return namedTool(raw.name ?? nested?.name, disableParallel, toolNames);
+  const name = raw.name ?? nested?.name;
+  const namespace = raw.namespace ?? nested?.namespace;
+  const qualified = typeof namespace === "string" && namespace && typeof name === "string"
+    ? name.startsWith("mcp__") || name.startsWith(`${namespace}__`)
+      ? name
+      : `${namespace}__${name}`
+    : name;
+  return namedTool(qualified, disableParallel, toolNames);
 }
 
 function requireTools(policy: ToolChoicePolicy, toolNames: Set<string>): ToolChoicePolicy {

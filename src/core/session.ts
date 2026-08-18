@@ -18,6 +18,8 @@ export interface PendingCall {
   toolUseId: string;
   name: string;
   input: unknown;
+  toolKind?: "function" | "custom";
+  namespace?: string;
   createdAt: number;
   resolved: boolean;
   resultDigest?: string;
@@ -76,7 +78,14 @@ export class Session {
     this.lastActivityAt = clock.now();
   }
 
-  createPending(name: string, input: unknown, clock: Clock, explicitId?: string): PendingCall {
+  createPending(
+    name: string,
+    input: unknown,
+    clock: Clock,
+    explicitId?: string,
+    toolKind?: "function" | "custom",
+    namespace?: string,
+  ): PendingCall {
     let resolve!: (value: SdkCustomToolResult) => void;
     let reject!: (error: Error) => void;
     const promise = new Promise<SdkCustomToolResult>((res, rej) => {
@@ -87,6 +96,8 @@ export class Session {
       toolUseId: toolUseId(explicitId),
       name,
       input,
+      ...(toolKind ? { toolKind } : {}),
+      ...(namespace ? { namespace } : {}),
       createdAt: clock.now(),
       resolved: false,
       promise,
