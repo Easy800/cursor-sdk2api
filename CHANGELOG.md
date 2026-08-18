@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `/v1/messages` accepts sub2api compatibility roles without flattening the transcript: `system`/`developer` remain in order, historical `tool`/`function` output stays visible to the Harness, and a trailing tool result requires a real call id before entering continuation lookup.
+- `/v1/responses` accepts `text.format.type=json_schema` as an explicit Harness output contract instead of silently dropping it. Client-executed function, custom/freeform, and namespace declarations inside `input[].type=additional_tools` join the real MCP tool catalog; a same-name top-level declaration is authoritative, matching Codex Responses Lite. Custom calls use native `custom_tool_call` events and namespace identities are restored on output. Conflicts within one additional catalog and provider-hosted tool shapes still fail closed.
 - `/v1/account` now reads current-period spending, remaining included usage, model-family percentages, plan metadata, and limits through Cursor Dashboard using the same User API Key, without Cookie or Team Admin credentials. Missing usage remains a partial response rather than a fabricated zero quota.
 - Added authenticated `/v1/messages/count_tokens` as an explicitly marked local estimate for Claude Code context management; it never starts an SDK run or participates in billing.
 

@@ -6,7 +6,9 @@ export function encodeMessage(turn: AssistantTurn, extra: Record<string, unknown
     type: "message",
     role: "assistant",
     model: turn.model,
-    content: turn.blocks,
+    content: turn.blocks.map((block) => block.type === "tool_use"
+      ? { type: block.type, id: block.id, name: block.name, input: block.input }
+      : block),
     stop_reason: turn.stopReason,
     stop_sequence: null,
     usage: encodeUsage(turn),

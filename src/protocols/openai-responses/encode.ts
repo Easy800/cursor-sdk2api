@@ -86,6 +86,23 @@ export function encodeFunctionCallItem(
     call_id: block.id,
     name: block.name,
     arguments: JSON.stringify(block.input ?? {}),
+    ...(block.namespace ? { namespace: block.namespace } : {}),
+  };
+}
+
+export function encodeCustomToolCallItem(
+  block: Extract<AnthropicContentBlock, { type: "tool_use" }>,
+  status = "completed",
+): Record<string, unknown> {
+  const record = block.input && typeof block.input === "object" ? block.input as Record<string, unknown> : {};
+  return {
+    id: functionCallItemId(block.id),
+    type: "custom_tool_call",
+    status,
+    call_id: block.id,
+    name: block.name,
+    input: typeof record.input === "string" ? record.input : JSON.stringify(block.input ?? ""),
+    ...(block.namespace ? { namespace: block.namespace } : {}),
   };
 }
 
@@ -96,7 +113,9 @@ export function encodeResponsesOutput(turn: AssistantTurn): Record<string, unkno
   const text = textOf(turn.blocks, "text");
   if (text) output.push(encodeMessageItem(turn.messageId, text));
   for (const block of turn.blocks) {
-    if (block.type === "tool_use") output.push(encodeFunctionCallItem(block));
+    if (block.type === "tool_use") {
+      output.push(block.tool_kind === "custom" ? encodeCustomToolCallItem(block) : encodeFunctionCallItem(block));
+    }
   }
   return output;
 }

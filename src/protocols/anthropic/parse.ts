@@ -22,6 +22,9 @@ export function parseMessagesRequest(body: unknown): ParsedMessages {
   }
 
   const messages = raw.messages.map(parseMessage);
+  if (!messages.some((message) => message.role === "user" || message.role === "assistant")) {
+    throw invalidRequest("messages must include at least one user or assistant message");
+  }
   const tools = Array.isArray(raw.tools) ? raw.tools.map(parseTool) : [];
   const names = new Set<string>();
   for (const tool of tools) {
@@ -30,7 +33,11 @@ export function parseMessagesRequest(body: unknown): ParsedMessages {
   }
 
   const lastUser = [...messages].reverse().find((message) => message.role === "user");
-  const continuation = lastUser ? parseContinuation(lastUser) : undefined;
+  const terminal = messages.at(-1);
+  if (terminal?.role === "tool" || terminal?.role === "function") {
+    throw invalidRequest(`trailing ${terminal.role} message requires tool_call_id, call_id, or id`);
+  }
+  const continuation = terminal?.role === "user" ? parseContinuation(terminal) : undefined;
   const images = collectImages(messages);
   const toolChoice = parseAnthropicToolChoice(
     raw.tool_choice,
@@ -101,8 +108,18 @@ export function parseModelParams(raw: Record<string, unknown>): Array<{ id: stri
 function parseMessage(value: unknown): AnthropicMessage {
   if (!value || typeof value !== "object") throw invalidRequest("each message must be an object");
   const raw = value as Record<string, unknown>;
-  if (raw.role !== "user" && raw.role !== "assistant") {
-    throw invalidRequest("message.role must be user or assistant");
+  if (
+    raw.role !== "user" &&
+    raw.role !== "assistant" &&
+    raw.role !== "system" &&
+    raw.role !== "developer" &&
+    raw.role !== "tool" &&
+    raw.role !== "function"
+  ) {
+    throw invalidRequest("message.role must be user, assistant, system, developer, tool, or function");
+  }
+  if (raw.role === "tool" || raw.role === "function") {
+    return parseCompatibilityToolMessage(raw, raw.role);
   }
   if (typeof raw.content === "string") {
     return { role: raw.role, content: raw.content };
@@ -111,6 +128,38 @@ function parseMessage(value: unknown): AnthropicMessage {
     throw invalidRequest("message.content must be a string or content block array");
   }
   return { role: raw.role, content: raw.content.map(parseBlock) };
+}
+
+function parseCompatibilityToolMessage(
+  raw: Record<string, unknown>,
+  role: "tool" | "function",
+): AnthropicMessage {
+  const toolUseId = firstString(raw.tool_call_id, raw.call_id, raw.id);
+  if (!toolUseId) {
+    return {
+      role,
+      content: compatibilityRoleText(raw.content, raw.name),
+    };
+  }
+  return {
+    role: "user",
+    content: [{
+      type: "tool_result",
+      tool_use_id: toolUseId,
+      content: raw.content,
+      is_error: raw.is_error === true,
+    }],
+  };
+}
+
+function firstString(...values: unknown[]): string | undefined {
+  return values.find((value): value is string => typeof value === "string" && value.length > 0);
+}
+
+function compatibilityRoleText(content: unknown, name: unknown): string {
+  const text = stringifyToolResult(content);
+  const label = typeof name === "string" && name ? ` name=${name}` : "";
+  return `[compatibility tool transcript${label}]\n${text}`;
 }
 
 function parseBlock(value: unknown): AnthropicContentBlock {
@@ -259,10 +308,10 @@ export function renderPrompt(parsed: ParsedMessages): { text: string; images: Ar
         if (block.type === "text") return block.text;
         if (block.type === "thinking") return `[thinking]\n${block.thinking}`;
         if (block.type === "tool_use") {
-          return `[tool_use ${block.name} ${block.id}]`;
+          return `[tool_use ${block.name} ${block.id}] input=${JSON.stringify(block.input ?? {})}`;
         }
         if (block.type === "tool_result") {
-          return `[tool_result ${block.tool_use_id}]`;
+          return `[tool_result ${block.tool_use_id} is_error=${block.is_error === true}]\n${stringifyToolResult(block.content)}`;
         }
         if (block.type === "image") return "[image]";
         return "";

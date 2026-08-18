@@ -12,11 +12,18 @@ export function mapClientTools(
 ): Record<string, SdkCustomTool> {
   const mapped: Record<string, SdkCustomTool> = {};
   for (const tool of tools) {
-    mapped[tool.name] = {
+    mapped[tool.sdk_name ?? tool.name] = {
       description: tool.description,
       inputSchema: tool.input_schema,
       async execute(args, context) {
-        const call = session.createPending(tool.name, args, clock, context.toolCallId);
+        const call = session.createPending(
+          tool.name,
+          args,
+          clock,
+          context.toolCallId,
+          tool.tool_kind,
+          tool.namespace,
+        );
         onExecute(session);
         if (session.pump) session.pump.notifyTool(call);
         else session.earlyCalls.push(call);

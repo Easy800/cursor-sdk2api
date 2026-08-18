@@ -1,4 +1,4 @@
-export type AnthropicRole = "user" | "assistant";
+export type AnthropicRole = "user" | "assistant" | "system" | "developer" | "tool" | "function";
 
 export type AnthropicContentBlock =
   | { type: "text"; text: string }
@@ -7,7 +7,14 @@ export type AnthropicContentBlock =
       type: "image";
       source: { type: "base64"; media_type: string; data: string } | { type: "url"; url: string };
     }
-  | { type: "tool_use"; id: string; name: string; input: unknown }
+  | {
+      type: "tool_use";
+      id: string;
+      name: string;
+      input: unknown;
+      tool_kind?: "function" | "custom";
+      namespace?: string;
+    }
   | {
       type: "tool_result";
       tool_use_id: string;
@@ -24,6 +31,9 @@ export interface AnthropicTool {
   name: string;
   description?: string;
   input_schema?: Record<string, unknown>;
+  tool_kind?: "function" | "custom";
+  sdk_name?: string;
+  namespace?: string;
 }
 
 export interface AnthropicMessagesRequest {
