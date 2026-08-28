@@ -1,6 +1,6 @@
 {
   "name": "cursor-sdk2api",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Independent MIT gateway that exposes official @cursor/sdk as Anthropic- and OpenAI-compatible HTTP APIs.",
   "license": "MIT",
   "type": "module",
@@ -41,7 +41,7 @@
     "secret:scan": "bash tests/secret-scan.sh"
   },
   "dependencies": {
-    "@cursor/sdk": "1.0.28",
+    "@cursor/sdk": "1.0.30",
     "proxy-agent": "8.0.2",
     "undici": "8.10.0"
   },

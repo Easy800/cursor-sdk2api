@@ -80,6 +80,57 @@ test("completed follow-up after process restart resumes the SDK agent", async ()
   expect(app2.sdk.lastCreate).toBeUndefined();
 });
 
+test("completed lineage resume preserves a tool callback fired inside resumeAgent", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "cursor-sdk2api-lineage-"));
+  const app1 = await startTestApp({
+    config: { stateDir },
+    sdk: { scripts: [[{ type: "text", chunks: ["first"] }]] },
+  });
+  apps.push(app1);
+  const first = await api(app1, "/v1/messages", {
+    method: "POST",
+    body: JSON.stringify({
+      model: "composer-2.5",
+      max_tokens: 16,
+      messages: [{ role: "user", content: "hello" }],
+      tools: [weatherTool()],
+    }),
+  });
+  const sessionId = ((await first.json()) as { cursor_session_id: string }).cursor_session_id;
+  await closeTestApp(app1);
+  apps.pop();
+
+  const app2 = await startTestApp({
+    config: { stateDir, firstEventTimeoutMs: 25 },
+    sdk: {
+      scripts: [[{ type: "hang" }]],
+      resumeEarlyToolCalls: [
+        { name: "lookup", input: { q: "weather" }, id: "completed_lineage_early" },
+      ],
+    },
+  });
+  apps.push(app2);
+  const follow = await api(app2, "/v1/messages", {
+    method: "POST",
+    headers: { "x-cursor-session-id": sessionId },
+    body: JSON.stringify({
+      model: "composer-2.5",
+      max_tokens: 16,
+      messages: [{ role: "user", content: "use the tool" }],
+      tools: [weatherTool()],
+    }),
+  });
+  const body = (await follow.json()) as { content: Array<{ type: string; id?: string; name?: string }> };
+
+  expect(follow.status).toBe(200);
+  expect(body.content).toContainEqual(expect.objectContaining({
+    type: "tool_use",
+    id: "completed_lineage_early",
+    name: "lookup",
+  }));
+  expect(app2.sdk.lastResume?.customTools).toBe(app2.sdk.agents[0]?.lastSend?.customTools);
+});
+
 test("lineage follow-up rejects credential and model mismatch", async () => {
   const stateDir = mkdtempSync(join(tmpdir(), "cursor-sdk2api-lineage-"));
   const app1 = await startTestApp({
@@ -245,11 +296,13 @@ test("lineage files are owner-only and expire", async () => {
   const stateDir = mkdtempSync(join(tmpdir(), "cursor-sdk2api-lineage-"));
   const store = new LineageStore(stateDir, clock);
   store.put({
-    version: 1,
+    version: 2,
     sessionId: "ses_perm",
     sdkAgentId: "agent-1",
     credentialFingerprint: "fp",
     modelId: "composer-2.5",
+    sessionPolicyFingerprint: "a".repeat(64),
+    executableToolCatalogFingerprint: "b".repeat(64),
     state: "completed",
     pendingToolIds: [],
     createdAt: 5_000,
@@ -312,6 +365,6 @@ test("lineage expiry blocks follow-up after TTL", async () => {
 test("createCursorRuntime opens JsonlLocalAgentStore under STATE_DIR", () => {
   const stateDir = mkdtempSync(join(tmpdir(), "cursor-sdk2api-sdk-store-"));
   const runtime = createCursorRuntime({ stateDir });
-  expect(runtime.sdkVersion).toMatch(/1\.0\./);
+  expect(runtime.sdkVersion).toBe("1.0.30");
   expect(existsSync(join(stateDir, "sdk-store"))).toBe(true);
 });

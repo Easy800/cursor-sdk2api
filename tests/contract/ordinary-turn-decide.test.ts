@@ -39,6 +39,7 @@ function completedRecord(first: ReturnType<typeof turn>, assistant = "first") {
     parentAssistantAnchor: first.lineage.parentAssistantAnchor,
     turnIndex: first.lineage.turnIndex,
     toolCatalogDigest: first.lineage.toolCatalogDigest,
+    sessionPolicyFingerprint: first.lineage.sessionPolicyFingerprint,
     assistantAnchor,
     agentId: "agent-1",
     credentialFingerprint: TENANT,
@@ -130,6 +131,21 @@ test("identical digest without in-memory replay fails closed", () => {
   expect(decision.action).toBe("fail_closed");
 });
 
+test("exact replay validates the stored session policy before replaying", () => {
+  const store = makeJournal();
+  const first = turn([{ role: "user", content: "hello" }]);
+  store.upsert({ ...completedRecord(first), sessionPolicyFingerprint: "a".repeat(64) });
+
+  expect(decideOrdinaryTurn({
+    turn: first,
+    journal: store,
+    inflight: new Set(),
+    now: 10,
+    enabled: true,
+    hasReplay: true,
+  })).toMatchObject({ action: "rebuild", reason: "lineage_mismatch" });
+});
+
 test("disabled coordinator always rebuilds", () => {
   const decision = decideOrdinaryTurn({
     turn: turn([{ role: "user", content: "hello" }]),
@@ -140,4 +156,27 @@ test("disabled coordinator always rebuilds", () => {
     hasReplay: false,
   });
   expect(decision).toEqual({ action: "rebuild", reason: "coordinator_disabled" });
+});
+
+test("ordinary successor rebuilds when the stored policy fingerprint is absent or changed", () => {
+  const first = turn([{ role: "user", content: "hello" }]);
+  const follow = turn([
+    { role: "user", content: "hello" },
+    { role: "assistant", content: "first" },
+    { role: "user", content: "next" },
+  ]);
+  for (const sessionPolicyFingerprint of [undefined, "a".repeat(64)]) {
+    const store = makeJournal();
+    store.upsert({ ...completedRecord(first), sessionPolicyFingerprint });
+    expect(
+      decideOrdinaryTurn({
+        turn: follow,
+        journal: store,
+        inflight: new Set(),
+        now: 10,
+        enabled: true,
+        hasReplay: false,
+      }),
+    ).toMatchObject({ action: "rebuild", reason: "lineage_mismatch" });
+  }
 });

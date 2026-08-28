@@ -57,6 +57,12 @@ export function decideOrdinaryTurn(input: {
   }
 
   const exact = journal.findExact(lineageKey, requestDigest);
+  if (
+    exact &&
+    exact.sessionPolicyFingerprint !== turn.lineage.sessionPolicyFingerprint
+  ) {
+    return { action: "rebuild", reason: "lineage_mismatch", record: exact };
+  }
   if (exact?.state === "completed") {
     if (hasReplay) return { action: "replay", reason: "identical_digest", record: exact };
     return { action: "fail_closed", reason: "completed_without_in_memory_response", record: exact };
@@ -95,6 +101,7 @@ export function decideOrdinaryTurn(input: {
       parent.tenantScope !== turn.tenantScope ||
       parent.effectiveModel !== turn.effectiveModel ||
       parent.toolCatalogDigest !== turn.lineage.toolCatalogDigest ||
+      parent.sessionPolicyFingerprint !== turn.lineage.sessionPolicyFingerprint ||
       Number(parent.channelId || 0) !== Number(turn.channelId || 0)
     ) {
       return { action: "rebuild", reason: "lineage_mismatch", record: parent };

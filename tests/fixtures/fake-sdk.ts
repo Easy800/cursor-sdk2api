@@ -21,6 +21,7 @@ import {
 export type FakeStep =
   | { type: "text"; chunks: string[]; pauseBetweenMs?: number; early?: boolean }
   | { type: "thinking"; chunks: string[]; early?: boolean }
+  | { type: "send-tools"; calls: Array<{ name: string; input: Record<string, unknown>; id?: string }> }
   | { type: "tools"; calls: Array<{ name: string; input: Record<string, unknown>; id?: string; delayMs?: number }> }
   | { type: "silent-final"; text: string }
   | { type: "empty" }
@@ -43,6 +44,8 @@ export interface FakeSdkOptions {
   createErrorsByApiKey?: Record<string, { message: string; name?: string } | Array<{ message: string; name?: string }>>;
   credentialProbeByApiKey?: Record<string, "valid" | "invalid" | "unavailable">;
   resumeError?: { message: string; name?: string };
+  /** Invoke these custom tools synchronously inside resumeAgent(), before the Agent is returned. */
+  resumeEarlyToolCalls?: Array<{ name: string; input: Record<string, unknown>; id?: string }>;
 }
 
 function configuredError(input: { message: string; name?: string }): Error {
@@ -276,6 +279,17 @@ export class FakeAgent implements SdkAgent {
       earlyCount,
     );
     this.runs.push(run);
+    if (first?.type === "send-tools") {
+      for (const call of first.calls) {
+        const tool = (sendInput.customTools ?? this.input.customTools)[call.name];
+        if (!tool) throw new Error(`fake sdk missing tool ${call.name}`);
+        void Promise.resolve(
+          tool.execute(call.input, { toolCallId: call.id ?? `sdk_${randomUUID()}` }),
+        ).then((result) => {
+          run.capturedToolResults.push(result);
+        });
+      }
+    }
     if (earlyCount > 0 && first && (first.type === "text" || first.type === "thinking")) {
       const kind = first.type === "thinking" ? "thinking-delta" : "text-delta";
       for (const chunk of first.chunks) {
@@ -310,7 +324,7 @@ export class FakeSdk implements SdkRuntime {
   readonly credentialProbeCalls: string[] = [];
 
   constructor(private readonly options: FakeSdkOptions = {}) {
-    this.sdkVersion = options.sdkVersion ?? "1.0.28";
+    this.sdkVersion = options.sdkVersion ?? "1.0.30";
     this.models = options.models ?? {
       ok: true,
       models: [{ id: "composer-2.5", displayName: "Composer 2.5" }],
@@ -359,6 +373,13 @@ export class FakeSdk implements SdkRuntime {
     this.lastResume = input;
     this.resumeCalls.push(input);
     this.lastAllowlist = apiProfileToolAllowlist(input.clientToolNames);
+    for (const call of this.options.resumeEarlyToolCalls ?? []) {
+      const tool = input.customTools[call.name];
+      if (!tool) throw new Error(`fake sdk missing resume tool ${call.name}`);
+      void Promise.resolve(
+        tool.execute(call.input, { toolCallId: call.id ?? `sdk_${randomUUID()}` }),
+      ).catch(() => undefined);
+    }
     const agent = new FakeAgent(
       input,
       this.takeScripts([[{ type: "text", chunks: ["resumed"] }]]),

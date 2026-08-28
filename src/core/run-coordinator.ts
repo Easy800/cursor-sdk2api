@@ -16,7 +16,7 @@ import type { Logger } from "../log.js";
 import type { ParsedMessages, ParsedToolResult } from "../protocols/anthropic/types.js";
 import { renderPrompt } from "../protocols/anthropic/parse.js";
 import { createAnthropicWriter } from "../protocols/anthropic/writer.js";
-import type { SdkDeltaUpdate, SdkRuntime } from "../sdk/port.js";
+import type { SdkRuntime } from "../sdk/port.js";
 import {
   currentTurnSendPayload,
   cursorAgentTurnFromParsed,
@@ -31,10 +31,28 @@ import { decideOrdinaryTurn } from "./ordinary-turn.js";
 import type { OrdinaryTurnJournal, OrdinaryTurnRecord } from "./ordinary-turn-journal.js";
 import { Session } from "./session.js";
 import { SessionRegistry } from "./session-registry.js";
-import { batchDigest, mapClientTools } from "./tool-bridge.js";
+import { SdkRunDriver, type SdkAgentSource } from "./sdk-run-driver.js";
+import { batchDigest } from "./tool-bridge.js";
 import { buildTranscriptRecovery } from "./transcript-recovery.js";
 import type { LineageRecord, LineageStore } from "./lineage-store.js";
-import type { TurnWriter, TurnWriterFactory } from "./turn-writer.js";
+import type { TurnWriter, TurnWriterFactory, TurnWriterSession } from "./turn-writer.js";
+import {
+  executableToolCatalogFingerprint,
+  sessionPolicyFingerprintFromParsed,
+} from "./session-policy.js";
+
+interface OrdinaryReplayEntry {
+  turn: NonNullable<Session["replay"]>["turn"];
+  writerSession: TurnWriterSession;
+  expiresAt: number;
+}
+
+interface FollowUpOptions {
+  send?: { text: string; images: Array<{ data: string; mimeType: string }> };
+  agent?: SdkAgentSource;
+  afterAgentReady?: () => void;
+  failureReason?: string;
+}
 
 export interface CoordinatorDeps {
   config: GatewayConfig;
@@ -62,30 +80,14 @@ function sameModelParams(
   right: Array<{ id: string; value: string }>,
 ): boolean {
   if (left.length !== right.length) return false;
-  return left.every((item, index) => item.id === right[index]?.id && item.value === right[index]?.value);
-}
-
-function createDeltaBridge() {
-  const early: SdkDeltaUpdate[] = [];
-  let pump: EventPump | undefined;
-  const ingest = (update: SdkDeltaUpdate) => {
-    early.push(update);
-    flush();
-  };
-  const flush = () => {
-    if (!pump) return;
-    while (early.length > 0) {
-      const next = early.shift();
-      if (next) pump.ingestDelta(next);
-    }
-  };
-  return {
-    ingest,
-    attach(next: EventPump) {
-      pump = next;
-      flush();
-    },
-  };
+  const normalized = (items: Array<{ id: string; value: string }>) =>
+    [...items].sort((a, b) => a.id.localeCompare(b.id) || a.value.localeCompare(b.value));
+  const normalizedLeft = normalized(left);
+  const normalizedRight = normalized(right);
+  return normalizedLeft.every(
+    (item, index) =>
+      item.id === normalizedRight[index]?.id && item.value === normalizedRight[index]?.value,
+  );
 }
 
 export class RunCoordinator {
@@ -98,13 +100,32 @@ export class RunCoordinator {
     { expiresAt: number; promise: Promise<{ session: Session; pump: EventPump }> }
   >();
   private readonly ordinaryInflight = new Map<string, Promise<void>>();
-  private readonly ordinaryReplay = new Map<string, { session: Session; expiresAt: number }>();
+  private readonly ordinaryReplay = new Map<string, OrdinaryReplayEntry>();
+  private readonly sdkRunDriver: SdkRunDriver;
 
   constructor(private readonly deps: CoordinatorDeps) {
+    this.sdkRunDriver = new SdkRunDriver({
+      sdk: deps.sdk,
+      clock: deps.clock,
+      toolBatchSettleMs: deps.config.toolBatchSettleMs,
+      firstEventTimeoutMs: deps.config.firstEventTimeoutMs,
+    });
     this.deps.ordinaryJournal?.setOnExpire((record) => {
       const session = this.findSessionByAgentId(record.agentId);
       if (session) this.deps.registry.forget(session, "ordinary_turn_expired");
     });
+  }
+
+  ordinaryReplayCount(): number {
+    return this.ordinaryReplay.size;
+  }
+
+  sweepOrdinaryState(): void {
+    this.deps.ordinaryJournal?.sweepExpired();
+    const now = this.deps.clock.now();
+    for (const [key, replay] of this.ordinaryReplay) {
+      if (now >= replay.expiresAt) this.ordinaryReplay.delete(key);
+    }
   }
 
   async handleMessages(
@@ -117,7 +138,7 @@ export class RunCoordinator {
     writerFactory: TurnWriterFactory = createAnthropicWriter,
   ): Promise<void> {
     this.deps.registry.sweep();
-    this.deps.ordinaryJournal?.sweepExpired();
+    this.sweepOrdinaryState();
     if (parsed.continuation) {
       await this.continueTurn(req, res, auth, parsed, parsed.continuation, requestId, writerFactory);
       return;
@@ -173,10 +194,10 @@ export class RunCoordinator {
     if (inflight) {
       await inflight;
       const cached = this.ordinaryReplay.get(key);
-      if (!cached?.session.replay) {
+      if (!cached) {
         throw sessionLost("completed Cursor ordinary turn cannot be replayed without its in-memory response");
       }
-      this.writeReplay(res, cached.session, parsed.stream, requestId, writerFactory);
+      this.writeReplay(res, cached, parsed.stream, requestId, writerFactory);
       return true;
     }
 
@@ -192,10 +213,10 @@ export class RunCoordinator {
     if (decision.action === "tool_continuation") return false;
     if (decision.action === "replay") {
       const cached = this.ordinaryReplay.get(key);
-      if (!cached?.session.replay) {
+      if (!cached) {
         throw sessionLost("completed Cursor ordinary turn cannot be replayed without its in-memory response");
       }
-      this.writeReplay(res, cached.session, parsed.stream, requestId, writerFactory);
+      this.writeReplay(res, cached, parsed.stream, requestId, writerFactory);
       return true;
     }
     if (decision.action === "fail_closed") {
@@ -206,10 +227,10 @@ export class RunCoordinator {
       if (pending) {
         await pending;
         const cached = this.ordinaryReplay.get(key);
-        if (!cached?.session.replay) {
+        if (!cached) {
           throw sessionLost("completed Cursor ordinary turn cannot be replayed without its in-memory response");
         }
-        this.writeReplay(res, cached.session, parsed.stream, requestId, writerFactory);
+        this.writeReplay(res, cached, parsed.stream, requestId, writerFactory);
         return true;
       }
     }
@@ -253,10 +274,10 @@ export class RunCoordinator {
     if (existing) {
       await existing;
       const cached = this.ordinaryReplay.get(key);
-      if (!cached?.session.replay) {
+      if (!cached) {
         throw sessionLost("completed Cursor ordinary turn cannot be replayed without its in-memory response");
       }
-      this.writeReplay(res, cached.session, parsed.stream, requestId, writerFactory);
+      this.writeReplay(res, cached, parsed.stream, requestId, writerFactory);
       return;
     }
 
@@ -281,6 +302,7 @@ export class RunCoordinator {
       parentAssistantAnchor: turn.lineage.parentAssistantAnchor,
       turnIndex: turn.lineage.turnIndex,
       toolCatalogDigest: turn.lineage.toolCatalogDigest,
+      sessionPolicyFingerprint: turn.lineage.sessionPolicyFingerprint,
       assistantAnchor: "",
       agentId: claim.mode === "resume" ? claim.parent.agentId : "",
       credentialFingerprint: auth.fingerprint,
@@ -330,9 +352,10 @@ export class RunCoordinator {
         live.state === "completed" &&
         live.credentialFingerprint === auth.fingerprint &&
         live.modelId === parsed.model &&
+        live.sessionPolicyFingerprint === turn.lineage.sessionPolicyFingerprint &&
         claim.parent.credentialFingerprint === auth.fingerprint
       ) {
-        live.ordinaryTurn = turn;
+        live.ordinaryReplayOwner = turn;
         this.traceOrdinary({
           action: "resume",
           reason: "exact_successor_live",
@@ -347,7 +370,7 @@ export class RunCoordinator {
           live,
           requestId,
           writerFactory,
-          currentTurnSendPayload(turn),
+          { send: currentTurnSendPayload(turn) },
         );
         return;
       }
@@ -393,6 +416,9 @@ export class RunCoordinator {
     requestId: string,
     writerFactory: TurnWriterFactory,
   ): Promise<void> {
+    if (parent.sessionPolicyFingerprint !== turn.lineage.sessionPolicyFingerprint) {
+      throw sessionConflict("session policy does not match the ordinary-turn owner");
+    }
     this.deps.registry.assertCanActivateRun({
       credentialFingerprint: auth.fingerprint,
     });
@@ -400,41 +426,37 @@ export class RunCoordinator {
       credentialFingerprint: auth.fingerprint,
       modelId: parsed.model,
       modelParams: parsed.modelParams,
+      sessionPolicyFingerprint: turn.lineage.sessionPolicyFingerprint,
+      executableToolCatalogFingerprint: executableToolCatalogFingerprint(parsed.tools),
     });
-    session.ordinaryTurn = turn;
-    try {
-      const customTools = mapClientTools(parsed.tools, session, this.deps.clock, () => undefined);
-      const agent = await this.deps.sdk.resumeAgent({
-        agentId: parent.agentId,
-        apiKey: auth.cursorApiKey,
-        modelId: parsed.model,
-        modelParams: session.modelParams,
-        workspaceDir: this.deps.workspaceDir,
-        clientToolNames: parsed.tools.map((tool) => tool.name),
-        customTools,
-      });
-      session.agent = agent;
-      session.sdkAgentId = parent.agentId;
-      this.traceOrdinary({
-        action: "resume",
-        reason: "exact_successor_store",
-        model: parsed.model,
-        send_chars: currentTurnSendPayload(turn).text.length,
-      });
-      await this.followUp(
-        req,
-        res,
-        auth,
-        parsed,
-        session,
-        requestId,
-        writerFactory,
-        currentTurnSendPayload(turn),
-      );
-    } catch (error) {
-      if (!res.headersSent) this.deps.registry.forget(session, "ordinary_resume_failed");
-      throw sdkFailure(error);
-    }
+    session.ordinaryReplayOwner = turn;
+    await this.followUp(
+      req,
+      res,
+      auth,
+      parsed,
+      session,
+      requestId,
+      writerFactory,
+      {
+        send: currentTurnSendPayload(turn),
+        agent: {
+          type: "resume",
+          agentId: parent.agentId,
+          apiKey: auth.cursorApiKey,
+          workspaceDir: this.deps.workspaceDir,
+        },
+        afterAgentReady: () => {
+          this.traceOrdinary({
+            action: "resume",
+            reason: "exact_successor_store",
+            model: parsed.model,
+            send_chars: currentTurnSendPayload(turn).text.length,
+          });
+        },
+        failureReason: "ordinary_resume_failed",
+      },
+    );
   }
 
   private traceOrdinary(event: {
@@ -472,7 +494,7 @@ export class RunCoordinator {
   }
 
   private rememberOrdinaryCompletion(session: Session): void {
-    const turn = session.ordinaryTurn;
+    const turn = session.ordinaryReplayOwner;
     const journal = this.deps.ordinaryJournal;
     if (!turn || !journal || !session.replay) return;
     if (session.state !== "completed" && session.state !== "awaiting_tool_results") return;
@@ -489,6 +511,7 @@ export class RunCoordinator {
       parentAssistantAnchor: turn.lineage.parentAssistantAnchor,
       turnIndex: turn.lineage.turnIndex,
       toolCatalogDigest: turn.lineage.toolCatalogDigest,
+      sessionPolicyFingerprint: session.sessionPolicyFingerprint,
       assistantAnchor,
       agentId: session.sdkAgentId ?? session.agent?.agentId ?? "",
       credentialFingerprint: session.credentialFingerprint,
@@ -499,9 +522,15 @@ export class RunCoordinator {
     };
     journal.upsert(completed);
     this.ordinaryReplay.set(ordinaryReplayKey(turn), {
-      session,
+      turn: structuredClone(session.replay.turn),
+      writerSession: {
+        sessionId: session.sessionId,
+        modelId: session.modelId,
+        createdAt: session.createdAt,
+      },
       expiresAt: completed.expiresAt,
     });
+    session.ordinaryReplayOwner = undefined;
     if (session.state === "completed") {
       session.retainOrdinaryAgent = true;
       session.retainUntil = completed.expiresAt;
@@ -522,40 +551,19 @@ export class RunCoordinator {
       credentialFingerprint: auth.fingerprint,
       modelId: parsed.model,
       modelParams: parsed.modelParams,
+      sessionPolicyFingerprint: sessionPolicyFingerprintFromParsed(parsed),
+      executableToolCatalogFingerprint: executableToolCatalogFingerprint(parsed.tools),
     });
-    if (ordinaryTurn) session.ordinaryTurn = ordinaryTurn;
-    const customTools = mapClientTools(parsed.tools, session, this.deps.clock, () => undefined);
+    if (ordinaryTurn) session.ordinaryReplayOwner = ordinaryTurn;
     try {
-      const agent = await this.deps.sdk.createAgent({
-        apiKey: auth.cursorApiKey,
-        modelId: parsed.model,
-        modelParams: session.modelParams,
-        workspaceDir: this.deps.workspaceDir,
-        clientToolNames: parsed.tools.map((tool) => tool.name),
-        customTools,
-      });
-      session.agent = agent;
-      session.sdkAgentId = agent.agentId;
-      session.state = "running";
       const prompt = sendOverride ?? renderPrompt(parsed);
-      const deltas = createDeltaBridge();
-      const run = await agent.send({
-        text: prompt.text,
-        images: prompt.images,
-        customTools,
-        onDelta: deltas.ingest,
-      });
-      session.run = run;
-      const pump = new EventPump(
+      const pump = await this.sdkRunDriver.start({
         session,
-        run,
-        this.deps.clock,
-        this.deps.config.toolBatchSettleMs,
-        this.deps.config.firstEventTimeoutMs,
-      );
-      session.pump = pump;
-      deltas.attach(pump);
-      pump.ingestEarly(session.earlyCalls.splice(0));
+        tools: parsed.tools,
+        agent: { type: "create", apiKey: auth.cursorApiKey, workspaceDir: this.deps.workspaceDir },
+        send: prompt,
+      });
+      session.state = "running";
       await this.drive(req, res, session, pump, parsed.stream, requestId, writerFactory);
     } catch (error) {
       if (!res.headersSent && session.state !== "awaiting_tool_results") {
@@ -573,10 +581,13 @@ export class RunCoordinator {
     session: Session,
     requestId: string,
     writerFactory: TurnWriterFactory,
-    sendOverride?: { text: string; images: Array<{ data: string; mimeType: string }> },
+    options: FollowUpOptions = {},
   ): Promise<void> {
-    this.assertIdentity(session, auth, parsed.model, parsed.modelParams);
-    if (!session.agent) {
+    this.assertIdentity(session, auth, parsed);
+    const agentSource = options.agent ?? (session.agent
+      ? { type: "existing" as const, agent: session.agent }
+      : undefined);
+    if (!agentSource) {
       throw sessionLost("Session cannot accept a follow-up send");
     }
     if (session.state !== "completed" && session.state !== "creating") {
@@ -595,29 +606,18 @@ export class RunCoordinator {
     session.lastResultDigest = undefined;
     session.replay = undefined;
     session.appliedBoundaryId = undefined;
-    const customTools = mapClientTools(parsed.tools, session, this.deps.clock, () => undefined);
-    const prompt = sendOverride ?? renderPrompt(parsed);
-    const deltas = createDeltaBridge();
+    const prompt = options.send ?? renderPrompt(parsed);
     try {
-      const run = await session.agent.send({
-        text: prompt.text,
-        images: prompt.images,
-        customTools,
-        onDelta: deltas.ingest,
-      });
-      session.run = run;
-      const pump = new EventPump(
+      const pump = await this.sdkRunDriver.start({
         session,
-        run,
-        this.deps.clock,
-        this.deps.config.toolBatchSettleMs,
-        this.deps.config.firstEventTimeoutMs,
-      );
-      session.pump = pump;
-      deltas.attach(pump);
+        tools: parsed.tools,
+        agent: agentSource,
+        send: prompt,
+        afterAgentReady: options.afterAgentReady,
+      });
       await this.drive(req, res, session, pump, parsed.stream, requestId, writerFactory);
     } catch (error) {
-      if (!res.headersSent) this.deps.registry.forget(session, "follow_up_failed");
+      if (!res.headersSent) this.deps.registry.forget(session, options.failureReason ?? "follow_up_failed");
       throw sdkFailure(error);
     }
   }
@@ -646,6 +646,18 @@ export class RunCoordinator {
       routingError = invalidRequest(`unknown tool_use_id: ${lookup.missing.join(",")}`);
     }
     if (!lookup.mixed && lookup.session && lookup.missing.length === 0) {
+      const effectiveParams =
+        parsed.modelParams.length > 0 ? parsed.modelParams : lookup.session.modelParams;
+      if (parsed.modelParams.length > 0 && !sameModelParams(lookup.session.modelParams, effectiveParams)) {
+        throw sessionConflict("model parameters do not match the live pending session");
+      }
+      if (
+        parsed.tools.length > 0 &&
+        lookup.session.executableToolCatalogFingerprint !==
+          executableToolCatalogFingerprint(parsed.tools)
+      ) {
+        throw sessionConflict("session policy does not match the live pending session");
+      }
       try {
         await this.continueLiveSession(req, res, auth, parsed, results, lookup.session, requestId, writerFactory);
         return;
@@ -657,6 +669,18 @@ export class RunCoordinator {
     if (!lookup.mixed && !lookup.session) {
       const recorded = this.deps.lineage?.findByToolIds(ids);
       if (recorded) {
+        const effectiveParams =
+          parsed.modelParams.length > 0 ? parsed.modelParams : recorded.modelParams ?? [];
+        if (parsed.modelParams.length > 0 && !sameModelParams(recorded.modelParams ?? [], effectiveParams)) {
+          throw sessionConflict("model parameters do not match the stored pending session");
+        }
+        if (
+          parsed.tools.length > 0 &&
+          recorded.executableToolCatalogFingerprint !==
+            executableToolCatalogFingerprint(parsed.tools)
+        ) {
+          throw sessionConflict("session policy does not match the stored pending session");
+        }
         try {
           await this.resumePendingLineage(
             req,
@@ -690,14 +714,14 @@ export class RunCoordinator {
   ): Promise<void> {
     const ids = results.map((result) => result.toolUseId);
     this.deps.registry.requireLive(session, ids);
-    this.assertIdentity(session, auth, parsed.model, parsed.modelParams);
+    this.assertPendingIdentity(session, auth, parsed);
 
     const digest = batchDigest(results);
     if (session.lastResultDigest && session.lastResultDigest !== digest) {
       throw sessionConflict("duplicate tool_use_id with a different result digest");
     }
     if (session.lastResultDigest === digest && session.state === "completed" && session.replay) {
-      this.writeReplay(res, session, parsed.stream, requestId, writerFactory);
+      this.writeReplay(res, { turn: session.replay.turn, writerSession: session }, parsed.stream, requestId, writerFactory);
       return;
     }
     if (session.state === "resuming" && session.lastResultDigest === digest && session.pump) {
@@ -716,6 +740,7 @@ export class RunCoordinator {
     if (unknown.length > 0) throw invalidRequest(`unknown tool_use_id: ${unknown.join(",")}`);
     if (missing.length > 0) throw invalidRequest(`missing tool_result for: ${missing.join(",")}`);
 
+    this.beginOrdinaryReplaySegment(session, auth, parsed);
     session.pump.beginNextSegment();
     session.lastResultDigest = digest;
     session.state = "resuming";
@@ -792,45 +817,20 @@ export class RunCoordinator {
       credentialFingerprint: auth.fingerprint,
       modelId: parsed.model,
       modelParams: parsed.modelParams,
+      sessionPolicyFingerprint: sessionPolicyFingerprintFromParsed(parsed),
+      executableToolCatalogFingerprint: executableToolCatalogFingerprint(parsed.tools),
     });
+    this.beginOrdinaryReplaySegment(session, auth, parsed);
     session.lastResultDigest = batchDigest(results);
-    const customTools = mapClientTools(
-      parsed.tools,
-      session,
-      this.deps.clock,
-      () => undefined,
-      recovery.completedResults,
-    );
-    const deltas = createDeltaBridge();
     try {
-      const agent = await this.deps.sdk.createAgent({
-        apiKey: auth.cursorApiKey,
-        modelId: parsed.model,
-        modelParams: session.modelParams,
-        workspaceDir: this.deps.workspaceDir,
-        clientToolNames: parsed.tools.map((tool) => tool.name),
-        customTools,
-      });
-      session.agent = agent;
-      session.sdkAgentId = agent.agentId;
-      session.state = "running";
-      const run = await agent.send({
-        text: recovery.prompt,
-        images: parsed.images,
-        customTools,
-        onDelta: deltas.ingest,
-      });
-      session.run = run;
-      const pump = new EventPump(
+      const pump = await this.sdkRunDriver.start({
         session,
-        run,
-        this.deps.clock,
-        this.deps.config.toolBatchSettleMs,
-        this.deps.config.firstEventTimeoutMs,
-      );
-      session.pump = pump;
-      deltas.attach(pump);
-      pump.ingestEarly(session.earlyCalls.splice(0));
+        tools: parsed.tools,
+        agent: { type: "create", apiKey: auth.cursorApiKey, workspaceDir: this.deps.workspaceDir },
+        send: { text: recovery.prompt, images: parsed.images },
+        completedResults: recovery.completedResults,
+      });
+      session.state = "running";
       return { session, pump };
     } catch (error) {
       this.deps.registry.forget(session, "transcript_recovery_failed");
@@ -906,44 +906,28 @@ export class RunCoordinator {
       credentialFingerprint: record.credentialFingerprint,
       modelId: record.modelId,
       modelParams: record.modelParams,
+      sessionPolicyFingerprint: record.sessionPolicyFingerprint,
+      executableToolCatalogFingerprint: record.executableToolCatalogFingerprint,
       instanceId: this.deps.registry.instanceId,
       clock: this.deps.clock,
     });
     session.state = "resuming";
+    this.beginOrdinaryReplaySegment(session, auth, parsed);
     session.lastResultDigest = digest;
     this.deps.registry.adopt(session);
 
-    const customTools = mapClientTools(parsed.tools, session, this.deps.clock, () => undefined);
-    const deltas = createDeltaBridge();
     try {
-      const agent = await this.deps.sdk.resumeAgent({
-        agentId: record.sdkAgentId,
-        apiKey: auth.cursorApiKey,
-        modelId: parsed.model,
-        modelParams: session.modelParams,
-        workspaceDir: this.deps.workspaceDir,
-        clientToolNames: parsed.tools.map((tool) => tool.name),
-        customTools,
-      });
-      session.agent = agent;
-      session.sdkAgentId = record.sdkAgentId;
-      const run = await agent.send({
-        text: recoveredToolResultPrompt(record, results),
-        customTools,
-        force: true,
-        onDelta: deltas.ingest,
-      });
-      session.run = run;
-      const pump = new EventPump(
+      const pump = await this.sdkRunDriver.start({
         session,
-        run,
-        this.deps.clock,
-        this.deps.config.toolBatchSettleMs,
-        this.deps.config.firstEventTimeoutMs,
-      );
-      session.pump = pump;
-      deltas.attach(pump);
-      pump.ingestEarly(session.earlyCalls.splice(0));
+        tools: parsed.tools,
+        agent: {
+          type: "resume",
+          agentId: record.sdkAgentId,
+          apiKey: auth.cursorApiKey,
+          workspaceDir: this.deps.workspaceDir,
+        },
+        send: { text: recoveredToolResultPrompt(record, results), force: true },
+      });
       for (const id of record.pendingToolIds) this.deps.registry.indexTool(id, session.sessionId);
       return { session, pump };
     } catch (error) {
@@ -1058,6 +1042,10 @@ export class RunCoordinator {
     if (record.credentialFingerprint !== auth.fingerprint || record.modelId !== parsed.model) {
       throw sessionConflict("credential or model does not match the stored session");
     }
+    const effectiveParams = parsed.modelParams.length > 0 ? parsed.modelParams : record.modelParams ?? [];
+    if (record.sessionPolicyFingerprint !== sessionPolicyFingerprintFromParsed(parsed, effectiveParams)) {
+      throw sessionConflict("session policy does not match the stored session");
+    }
     if (parsed.modelParams.length > 0 && !sameModelParams(record.modelParams ?? [], parsed.modelParams)) {
       throw sessionConflict("model parameters do not match the stored session");
     }
@@ -1072,30 +1060,21 @@ export class RunCoordinator {
       credentialFingerprint: record.credentialFingerprint,
       modelId: record.modelId,
       modelParams: record.modelParams,
+      sessionPolicyFingerprint: record.sessionPolicyFingerprint,
+      executableToolCatalogFingerprint: record.executableToolCatalogFingerprint,
       instanceId: this.deps.registry.instanceId,
       clock: this.deps.clock,
     });
     this.deps.registry.adopt(session);
-    try {
-      const customTools = mapClientTools(parsed.tools, session, this.deps.clock, () => undefined);
-      const agent = await this.deps.sdk.resumeAgent({
+    await this.followUp(req, res, auth, parsed, session, requestId, writerFactory, {
+      agent: {
+        type: "resume",
         agentId: record.sdkAgentId,
         apiKey: auth.cursorApiKey,
-        modelId: parsed.model,
-        modelParams: session.modelParams,
         workspaceDir: this.deps.workspaceDir,
-        clientToolNames: parsed.tools.map((tool) => tool.name),
-        customTools,
-      });
-      session.agent = agent;
-      session.sdkAgentId = record.sdkAgentId;
-      await this.followUp(req, res, auth, parsed, session, requestId, writerFactory);
-    } catch (error) {
-      if (!res.headersSent) {
-        this.deps.registry.forget(session, "resume_failed");
-      }
-      throw sdkFailure(error);
-    }
+      },
+      failureReason: "resume_failed",
+    });
   }
 
   private persistLineage(session: Session): void {
@@ -1108,12 +1087,14 @@ export class RunCoordinator {
     const ttl =
       session.state === "failed" ? this.deps.config.replayTtlMs : this.deps.config.sessionTtlMs;
     const record: LineageRecord = {
-      version: 1,
+      version: 2,
       sessionId: session.sessionId,
       sdkAgentId,
       credentialFingerprint: session.credentialFingerprint,
       modelId: session.modelId,
       ...(session.modelParams.length > 0 ? { modelParams: session.modelParams } : {}),
+      sessionPolicyFingerprint: session.sessionPolicyFingerprint,
+      executableToolCatalogFingerprint: session.executableToolCatalogFingerprint,
       state: session.state as LineageRecord["state"],
       pendingToolIds:
         session.state === "awaiting_tool_results" ? [...session.pending.keys()] : [],
@@ -1142,36 +1123,74 @@ export class RunCoordinator {
 
   private writeReplay(
     res: ServerResponse,
-    session: Session,
+    replay: { turn: NonNullable<Session["replay"]>["turn"]; writerSession: TurnWriterSession },
     stream: boolean,
     requestId: string,
     writerFactory: TurnWriterFactory,
   ): void {
-    const turn = session.replay?.turn;
-    if (!turn) throw sessionLost("Replay record is missing");
+    const turn = replay.turn;
     const writer = writerFactory({
       res,
       stream,
       requestId,
-      session,
+      session: replay.writerSession,
       messageId: turn.messageId,
     });
     writer.finish(turn, { replayed: true });
   }
 
+  private beginOrdinaryReplaySegment(
+    session: Session,
+    auth: AuthContext,
+    parsed: ParsedMessages,
+  ): void {
+    if (!this.deps.config.ordinaryTurnCoordinator || !this.deps.ordinaryJournal) return;
+    if (session.ordinaryReplayOwner) {
+      throw sessionConflict("session already has an active ordinary replay segment owner");
+    }
+    session.ordinaryReplayOwner = cursorAgentTurnFromParsed(parsed, {
+      tenantScope: auth.fingerprint,
+    });
+  }
+
   private assertIdentity(
     session: Session,
     auth: AuthContext,
-    model: string,
-    requestedParams: Array<{ id: string; value: string }>,
+    parsed: ParsedMessages,
+  ): void {
+    this.assertModelIdentity(session, auth, parsed);
+    const effectiveParams = parsed.modelParams.length > 0 ? parsed.modelParams : session.modelParams;
+    if (session.sessionPolicyFingerprint !== sessionPolicyFingerprintFromParsed(parsed, effectiveParams)) {
+      throw sessionConflict("session policy does not match the session owner");
+    }
+  }
+
+  private assertPendingIdentity(
+    session: Session,
+    auth: AuthContext,
+    parsed: ParsedMessages,
+  ): void {
+    this.assertModelIdentity(session, auth, parsed);
+    if (
+      parsed.tools.length > 0 &&
+      session.executableToolCatalogFingerprint !== executableToolCatalogFingerprint(parsed.tools)
+    ) {
+      throw sessionConflict("tool catalog does not match the pending session owner");
+    }
+  }
+
+  private assertModelIdentity(
+    session: Session,
+    auth: AuthContext,
+    parsed: ParsedMessages,
   ): void {
     if (session.credentialFingerprint !== auth.fingerprint) {
       throw sessionConflict("credential identity does not match the session owner");
     }
-    if (session.modelId !== model) {
+    if (session.modelId !== parsed.model) {
       throw sessionConflict("model does not match the session owner");
     }
-    if (requestedParams.length > 0 && !sameModelParams(session.modelParams, requestedParams)) {
+    if (parsed.modelParams.length > 0 && !sameModelParams(session.modelParams, parsed.modelParams)) {
       throw sessionConflict("model parameters do not match the session owner");
     }
     if (session.instanceId !== this.deps.registry.instanceId) {

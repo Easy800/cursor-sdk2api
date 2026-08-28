@@ -2,7 +2,8 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, test } from "vitest";
-import { api, closeTestApp, startTestApp, type TestContext } from "../helpers/app.js";
+import { FakeClock } from "../../src/clock.js";
+import { api, closeTestApp, startTestApp, weatherTool, type TestContext } from "../helpers/app.js";
 
 let ctx: TestContext;
 
@@ -53,6 +54,94 @@ test("exact ordinary next turn reuses one Agent and sends only current text", as
   expect(ctx.sdk.agents[0]?.lastSend?.text).not.toContain("hello");
 });
 
+test("an explicit session follow-up never seeds headerless ordinary replay", async () => {
+  ctx = await startTestApp({
+    sdk: {
+      agentScripts: [
+        [
+          [{ type: "text", chunks: ["first"] }],
+          [{ type: "text", chunks: ["contextual"] }],
+        ],
+        [[{ type: "text", chunks: ["fresh"] }]],
+      ],
+    },
+  });
+  const first = await api(ctx, "/v1/messages", {
+    method: "POST",
+    body: JSON.stringify({
+      model: "composer-2.5",
+      max_tokens: 16,
+      messages: [{ role: "user", content: "hello" }],
+    }),
+  });
+  expect(first.status).toBe(200);
+  const sessionId = first.headers.get("x-cursor-session-id");
+  expect(sessionId).toMatch(/^ses_/);
+
+  const minimal = {
+    model: "composer-2.5",
+    max_tokens: 16,
+    messages: [{ role: "user", content: "same" }],
+  };
+  const contextual = await api(ctx, "/v1/messages", {
+    method: "POST",
+    headers: { "x-cursor-session-id": sessionId as string },
+    body: JSON.stringify(minimal),
+  });
+  const contextualBody = (await contextual.json()) as { content: Array<{ text?: string }> };
+  expect(contextual.status).toBe(200);
+  expect(contextualBody.content[0]?.text).toBe("contextual");
+
+  const headerless = await api(ctx, "/v1/messages", {
+    method: "POST",
+    body: JSON.stringify(minimal),
+  });
+  const headerlessBody = (await headerless.json()) as { content: Array<{ text?: string }> };
+  expect(headerless.status).toBe(200);
+  expect(headerlessBody.content[0]?.text).toBe("fresh");
+  expect(ctx.sdk.createCalls).toHaveLength(2);
+});
+
+test("reused Agent publishes a tool called synchronously during follow-up send", async () => {
+  ctx = await startTestApp({
+    config: { firstEventTimeoutMs: 25 },
+    sdk: {
+      scripts: [
+        [{ type: "text", chunks: ["first"] }],
+        [
+          { type: "send-tools", calls: [{ name: "lookup", input: { q: "weather" }, id: "early_followup" }] },
+          { type: "hang" },
+        ],
+      ],
+    },
+  });
+  const first = await api(ctx, "/v1/messages", {
+    method: "POST",
+    body: JSON.stringify({
+      model: "composer-2.5",
+      max_tokens: 16,
+      messages: [{ role: "user", content: "hello" }],
+      tools: [weatherTool()],
+    }),
+  });
+  const firstBody = (await first.json()) as { content: Array<{ text?: string }> };
+
+  const follow = await api(ctx, "/v1/messages", {
+    method: "POST",
+    body: JSON.stringify(followBody(firstBody.content[0]?.text ?? "first", "use the tool", {
+      tools: [weatherTool()],
+    })),
+  });
+  const body = (await follow.json()) as { content: Array<{ type: string; id?: string; name?: string }> };
+
+  expect(follow.status).toBe(200);
+  expect(body.content).toContainEqual(expect.objectContaining({
+    type: "tool_use",
+    id: "early_followup",
+    name: "lookup",
+  }));
+});
+
 test("feature flag off keeps a cold rebuild for every ordinary turn", async () => {
   ctx = await startTestApp({
     config: { ordinaryTurnCoordinator: false },
@@ -100,6 +189,180 @@ test("identical request digest replays without a second SDK send", async () => {
   expect(((await a.json()) as { content: unknown }).content).toEqual(
     ((await later.json()) as { content: unknown }).content,
   );
+});
+
+test("same user text under a different system prompt never replays the old response", async () => {
+  ctx = await startTestApp({
+    sdk: {
+      agentScripts: [
+        [[{ type: "text", chunks: ["from-system-a"] }]],
+        [[{ type: "text", chunks: ["from-system-b"] }]],
+      ],
+    },
+  });
+  const body = (system: string) => ({
+    model: "composer-2.5",
+    max_tokens: 16,
+    system,
+    messages: [{ role: "user", content: "same user text" }],
+  });
+
+  const first = await api(ctx, "/v1/messages", {
+    method: "POST",
+    body: JSON.stringify(body("system A")),
+  });
+  expect(first.status).toBe(200);
+
+  const second = await api(ctx, "/v1/messages", {
+    method: "POST",
+    body: JSON.stringify(body("system B")),
+  });
+  const secondBody = (await second.json()) as { content: Array<{ text?: string }> };
+  expect(second.status).toBe(200);
+  expect(secondBody.content[0]?.text).toBe("from-system-b");
+  expect(ctx.sdk.createCalls).toHaveLength(2);
+});
+
+test("an earlier ordinary turn replays its own response after a later turn completes", async () => {
+  ctx = await startTestApp({
+    sdk: {
+      scripts: [[{ type: "text", chunks: ["first"] }], [{ type: "text", chunks: ["second"] }]],
+    },
+  });
+  const firstPayload = {
+    model: "composer-2.5",
+    max_tokens: 16,
+    messages: [{ role: "user", content: "hello" }],
+  };
+  const first = await api(ctx, "/v1/messages", {
+    method: "POST",
+    body: JSON.stringify(firstPayload),
+  });
+  const firstBody = (await first.json()) as { content: Array<{ text?: string }> };
+
+  const follow = await api(ctx, "/v1/messages", {
+    method: "POST",
+    body: JSON.stringify(followBody(firstBody.content[0]?.text ?? "first")),
+  });
+  expect(follow.status).toBe(200);
+
+  const replay = await api(ctx, "/v1/messages", {
+    method: "POST",
+    body: JSON.stringify(firstPayload),
+  });
+  const replayBody = (await replay.json()) as { content: Array<{ text?: string }> };
+  expect(replay.status).toBe(200);
+  expect(replayBody.content[0]?.text).toBe("first");
+  expect(ctx.sdk.createCalls).toHaveLength(1);
+  expect(ctx.sdk.agents[0]?.runs).toHaveLength(2);
+});
+
+test("an ordinary tool request replays its original tool_use after its continuation completes", async () => {
+  ctx = await startTestApp({
+    sdk: {
+      scripts: [[
+        { type: "tools", calls: [{ name: "lookup", input: { q: "weather" }, id: "initial_tool" }] },
+        { type: "text", chunks: ["sunny"] },
+      ]],
+    },
+  });
+  const initialPayload = {
+    model: "composer-2.5",
+    max_tokens: 16,
+    messages: [{ role: "user", content: "weather?" }],
+    tools: [weatherTool()],
+  };
+  const initial = await api(ctx, "/v1/messages", {
+    method: "POST",
+    body: JSON.stringify(initialPayload),
+  });
+  const initialBody = (await initial.json()) as {
+    content: Array<{ type: string; id?: string; name?: string }>;
+    stop_reason: string;
+  };
+  expect(initial.status).toBe(200);
+  expect(initialBody.stop_reason).toBe("tool_use");
+  expect(initialBody.content).toContainEqual(expect.objectContaining({
+    type: "tool_use",
+    id: "initial_tool",
+    name: "lookup",
+  }));
+
+  const continued = await api(ctx, "/v1/messages", {
+    method: "POST",
+    body: JSON.stringify({
+      ...initialPayload,
+      messages: [
+        ...initialPayload.messages,
+        { role: "assistant", content: initialBody.content },
+        {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "initial_tool", content: "72F" }],
+        },
+      ],
+    }),
+  });
+  const continuedBody = (await continued.json()) as {
+    content: Array<{ type: string; text?: string }>;
+    stop_reason: string;
+  };
+  expect(continued.status).toBe(200);
+  expect(continuedBody.stop_reason).toBe("end_turn");
+  expect(continuedBody.content).toContainEqual(expect.objectContaining({ type: "text", text: "sunny" }));
+
+  const replay = await api(ctx, "/v1/messages", {
+    method: "POST",
+    body: JSON.stringify(initialPayload),
+  });
+  const replayBody = (await replay.json()) as {
+    content: Array<{ type: string; id?: string; name?: string; text?: string }>;
+    stop_reason: string;
+  };
+  expect(replay.status).toBe(200);
+  expect(replayBody.stop_reason).toBe("tool_use");
+  expect(replayBody.content).toEqual(initialBody.content);
+  expect(replayBody.content).not.toContainEqual(expect.objectContaining({ type: "text", text: "sunny" }));
+  expect(ctx.sdk.createCalls).toHaveLength(1);
+  expect(ctx.sdk.agents[0]?.runs).toHaveLength(1);
+});
+
+test("expired ordinary replay is released and the same request runs again", async () => {
+  const clock = new FakeClock(1_000);
+  ctx = await startTestApp({
+    clock,
+    config: { sessionTtlMs: 1_000, sweepIntervalMs: 5 },
+    sdk: {
+      agentScripts: [
+        [[{ type: "text", chunks: ["first"] }]],
+        [[{ type: "text", chunks: ["rebuilt"] }]],
+      ],
+    },
+  });
+  const payload = {
+    model: "composer-2.5",
+    max_tokens: 16,
+    messages: [{ role: "user", content: "expire me" }],
+  };
+  const first = await api(ctx, "/v1/messages", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  expect(first.status).toBe(200);
+  expect(ctx.app.coordinator.ordinaryReplayCount()).toBe(1);
+
+  clock.advance(1_001);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  expect(ctx.app.coordinator.ordinaryReplayCount()).toBe(0);
+  expect(ctx.sdk.agents[0]?.closed).toBe(true);
+
+  const retried = await api(ctx, "/v1/messages", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  const retriedBody = (await retried.json()) as { content: Array<{ text?: string }> };
+  expect(retried.status).toBe(200);
+  expect(retriedBody.content[0]?.text).toBe("rebuilt");
+  expect(ctx.sdk.createCalls).toHaveLength(2);
 });
 
 test("a forked successor cold-rebuilds without sending on the original Agent", async () => {
@@ -251,6 +514,48 @@ test("process restart resumes the persisted Agent and sends only the current tur
   expect(ctx.sdk.resumeCalls).toHaveLength(1);
   expect(ctx.sdk.lastResume?.agentId).toBe(agentId);
   expect(ctx.sdk.agents[0]?.lastSend?.text).toBe("next");
+});
+
+test("persisted ordinary resume preserves a tool callback fired inside resumeAgent", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "cursor-sdk2api-ordinary-"));
+  const firstApp = await startTestApp({
+    config: { stateDir },
+    sdk: { scripts: [[{ type: "text", chunks: ["first"] }]] },
+  });
+  const first = await api(firstApp, "/v1/messages", {
+    method: "POST",
+    body: JSON.stringify({
+      model: "composer-2.5",
+      max_tokens: 16,
+      messages: [{ role: "user", content: "hello" }],
+      tools: [weatherTool()],
+    }),
+  });
+  const assistant = ((await first.json()) as { content: Array<{ text?: string }> }).content[0]?.text ?? "first";
+  await closeTestApp(firstApp);
+
+  ctx = await startTestApp({
+    config: { stateDir, firstEventTimeoutMs: 25 },
+    sdk: {
+      scripts: [[{ type: "hang" }]],
+      resumeEarlyToolCalls: [
+        { name: "lookup", input: { q: "weather" }, id: "persisted_ordinary_early" },
+      ],
+    },
+  });
+  const follow = await api(ctx, "/v1/messages", {
+    method: "POST",
+    body: JSON.stringify(followBody(assistant, "use the tool", { tools: [weatherTool()] })),
+  });
+  const body = (await follow.json()) as { content: Array<{ type: string; id?: string; name?: string }> };
+
+  expect(follow.status).toBe(200);
+  expect(body.content).toContainEqual(expect.objectContaining({
+    type: "tool_use",
+    id: "persisted_ordinary_early",
+    name: "lookup",
+  }));
+  expect(ctx.sdk.lastResume?.customTools).toBe(ctx.sdk.agents[0]?.lastSend?.customTools);
 });
 
 test("Responses exact successor sends only the current turn", async () => {
