@@ -7,14 +7,23 @@ import {
   type AuthContext,
   type ClientAuthorization,
 } from "../auth/credentials.js";
+import { fetchCursorSandQuota } from "../account/cursor-dashboard.js";
 import { readAccount } from "../account/service.js";
 import { CursorAccountFileStore, type StoredCursorAccount } from "../account/file-store.js";
+import {
+  DEFAULT_RUNTIME_PROFILE,
+  resolveRequestProfile,
+  type RuntimeProfile,
+} from "../core/runtime-profile.js";
 import type { Clock } from "../clock.js";
 import type { GatewayConfig } from "../config.js";
+import { CompactAnchorStore } from "../core/compact-anchor.js";
 import { RunCoordinator } from "../core/run-coordinator.js";
 import type { PumpBoundary } from "../core/event-pump.js";
 import { LineageStore } from "../core/lineage-store.js";
 import { OrdinaryTurnJournal } from "../core/ordinary-turn-journal.js";
+import { RuntimeLedger } from "../core/runtime-ledger.js";
+import { inspectSandLoader, type SandLoaderHealth } from "../sdk/sand-loader.js";
 import { SessionRegistry } from "../core/session-registry.js";
 import {
   forbiddenError,
@@ -36,6 +45,11 @@ import { writeSseError } from "../protocols/anthropic/sse.js";
 import { parseChatCompletionsRequest } from "../protocols/openai-chat/parse.js";
 import { writeChatStreamError } from "../protocols/openai-chat/sse.js";
 import { createChatWriterFactory } from "../protocols/openai-chat/writer.js";
+import {
+  bindCompactContinuation,
+  mintLocalCompact,
+  writeLocalCompactResponse,
+} from "../protocols/openai-responses/compact.js";
 import { parseResponsesRequest } from "../protocols/openai-responses/parse.js";
 import { writeResponsesStreamError } from "../protocols/openai-responses/sse.js";
 import { createResponsesWriterFactory } from "../protocols/openai-responses/writer.js";
@@ -53,9 +67,12 @@ export interface App {
   ordinaryJournal: OrdinaryTurnJournal;
   accounts: CursorAccountFileStore;
   sdk: SdkRuntime;
+  ledger?: RuntimeLedger;
+  sandHealth: SandLoaderHealth;
   handler: (req: IncomingMessage, res: ServerResponse) => Promise<void>;
   listen(): Server;
   beginShutdown(): void;
+  close(): void;
 }
 
 async function listManagedModels(accounts: StoredCursorAccount[], catalog: ModelCatalog): Promise<{
@@ -124,8 +141,17 @@ export function createApp(input: {
   logger: Logger;
   workspaceDir: string;
   beforeApplyBoundary?: (boundary: PumpBoundary) => Promise<void>;
+  fetchSandQuota?: typeof fetchCursorSandQuota;
+  sandHealth?: SandLoaderHealth;
+  assertSandAccess?: (apiKey: string) => Promise<void>;
 }): App {
   const { config, sdk, clock, logger, workspaceDir, beforeApplyBoundary } = input;
+  const fetchSandQuota = input.fetchSandQuota ?? fetchCursorSandQuota;
+  const sandHealth = input.sandHealth ?? inspectSandLoader();
+  const assertSandAccess = input.assertSandAccess ?? (async (apiKey: string) => {
+    const quota = await fetchSandQuota(apiKey);
+    if (!quota.available) throw forbiddenError("Sand is unavailable until Grok Bot access is granted");
+  });
   const registry = new SessionRegistry(clock, config.instanceId, {
     globalActiveRuns: config.globalActiveRuns,
     perCredentialActiveRuns: config.perCredentialActiveRuns,
@@ -135,9 +161,13 @@ export function createApp(input: {
     runDeadlineMs: config.runDeadlineMs,
   });
   const lineage = new LineageStore(config.stateDir, clock);
+  const compactStore = new CompactAnchorStore(config.stateDir, clock);
   const ordinaryJournal = new OrdinaryTurnJournal(join(config.stateDir, "ordinary-turns.json"), {
     now: () => clock.now(),
   });
+  const ledger = config.runtimeLedgerV2
+    ? RuntimeLedger.open(config.stateDir, { clock, migrateLegacy: true })
+    : undefined;
   const coordinator = new RunCoordinator({
     config,
     sdk,
@@ -147,11 +177,26 @@ export function createApp(input: {
     workspaceDir,
     lineage,
     ordinaryJournal,
+    ledger,
+    sandHealth,
+    assertSandAccess,
     beforeApplyBoundary,
   });
   const catalog = new ModelCatalog(sdk, clock, config.catalogCacheMs);
   const accounts = new CursorAccountFileStore(config.stateDir, config.managedCursorKey);
   const accountPool = new CursorAccountPool();
+  const accountPayload = (apiKey: string, defaultProfile?: RuntimeProfile) =>
+    readAccount(sdk, apiKey, {
+      fetchSandQuota,
+      defaultProfile: defaultProfile ?? config.runtimePolicy.defaultProfile ?? DEFAULT_RUNTIME_PROFILE,
+      sandLoaderReady: sandHealth.ready,
+    });
+  const publicAccount = (account: StoredCursorAccount) => ({
+    id: account.id,
+    key_hint: account.keyHint,
+    added_at: account.addedAt,
+    default_profile: account.defaultProfile,
+  });
 
   const boundCredentialFingerprint = (parsed: ParsedMessages, sessionHint?: string): string | undefined => {
     if (parsed.continuation) {
@@ -175,7 +220,7 @@ export function createApp(input: {
     const boundFingerprint = parsed ? boundCredentialFingerprint(parsed, sessionHint) : undefined;
     if (boundFingerprint && !excludedFingerprints.has(boundFingerprint)) {
       const bound = accounts.findByFingerprint(boundFingerprint);
-      if (bound) return managedAccountAuth(bound.apiKey);
+      if (bound) return managedAccountAuth(bound.apiKey, bound.defaultProfile);
       // A self-contained tool continuation can cold-branch from its full
       // transcript when the originally bound managed account was removed.
       // Completed session follow-ups still require their original account.
@@ -223,7 +268,7 @@ export function createApp(input: {
 
     const selected = accountPool.pick(candidates, parsed?.model ?? "account");
     if (!selected) throw upstreamError("No Cursor account is available", 503);
-    return managedAccountAuth(selected.apiKey);
+    return managedAccountAuth(selected.apiKey, selected.defaultProfile);
   };
 
   const resolveAuth = async (
@@ -294,11 +339,26 @@ export function createApp(input: {
       await run(alternate);
     }
   };
+
+  const runtimeProfileFor = (req: IncomingMessage, client: ClientAuthorization, auth?: AuthContext) => {
+    try {
+      return resolveRequestProfile({
+        header: headerValue(req, "x-cursor-runtime-profile"),
+        policy: config.runtimePolicy,
+        authMode: client.mode,
+        accountDefaultProfile: auth?.defaultProfile,
+      });
+    } catch (error) {
+      throw invalidRequest(error instanceof Error ? error.message : "Invalid runtime profile");
+    }
+  };
+
   let shuttingDown = false;
   const sweepTimer = setInterval(() => {
     try {
       registry.sweep();
       lineage.sweep();
+      compactStore.sweep();
       coordinator.sweepOrdinaryState();
     } catch {
       // sweep must not crash the process
@@ -335,6 +395,20 @@ export function createApp(input: {
             },
             runtime: "local",
             instance_id: config.instanceId,
+            profiles: {
+              default: config.runtimePolicy.defaultProfile,
+              sdk: {
+                ready: true,
+                sdk_version:
+                  sdk.sdkVersion && sdk.sdkVersion !== "unavailable" ? sdk.sdkVersion : config.sdkVersion,
+              },
+              sand: {
+                ready: sandHealth.ready,
+                sdk_version: sandHealth.sdk_version,
+                patch_contract_version: sandHealth.patch_contract_version,
+                ...(sandHealth.ready || !sandHealth.reason ? {} : { reason: sandHealth.reason }),
+              },
+            },
             readiness: {
               accepting_sessions: !shuttingDown && !registry.shuttingDown,
               shutting_down: shuttingDown,
@@ -366,10 +440,10 @@ export function createApp(input: {
         if (!id) throw invalidRequest("id is required");
         const stored = accounts.get(id);
         if (!stored) throw notFound("Persistent account was not found");
-        const auth = managedAccountAuth(stored.apiKey);
+        const auth = managedAccountAuth(stored.apiKey, stored.defaultProfile);
         const [models, account] = await Promise.all([
           catalog.list(stored.apiKey, auth.fingerprint),
-          readAccount(sdk, stored.apiKey),
+          accountPayload(stored.apiKey, stored.defaultProfile),
         ]);
         sendJson(res, 200, {
           models: {
@@ -403,7 +477,7 @@ export function createApp(input: {
         const stored = accounts.get(id);
         if (!stored) throw notFound("Persistent account was not found");
         if (!body || body.request === undefined) throw invalidRequest("request is required");
-        const auth = managedAccountAuth(stored.apiKey);
+        const auth = managedAccountAuth(stored.apiKey, stored.defaultProfile);
         if (protocol === "messages") {
           const parsed = parseMessagesRequest(body.request);
           await coordinator.handleMessages(req, res, auth, parsed, requestId);
@@ -423,11 +497,39 @@ export function createApp(input: {
           return;
         }
         if (protocol === "responses") {
-          const responses = parseResponsesRequest(body.request);
+        const responses = parseResponsesRequest(body.request, {
+          hostedSearchMode: config.runtimePolicy.hostedSearchMode,
+        });
           await coordinator.handleMessages(req, res, auth, responses.parsed, requestId, undefined, createResponsesWriterFactory());
           return;
         }
         throw invalidRequest("protocol must be messages, chat, or responses");
+      }
+
+      if (path === "/v0/management/accounts/default_profile" && method === "PUT") {
+        const body = await readJsonBody(req, config.maxBodyBytes) as {
+          id?: unknown;
+          default_profile?: unknown;
+        } | undefined;
+        const id = typeof body?.id === "string" ? body.id.trim() : "";
+        if (!id) throw invalidRequest("id is required");
+        const stored = accounts.get(id);
+        if (!stored) throw notFound("Persistent account was not found");
+        const rawProfile = typeof body?.default_profile === "string" ? body.default_profile.trim().toLowerCase() : "";
+        if (rawProfile !== "sdk" && rawProfile !== "sand") {
+          throw invalidRequest("default_profile is invalid");
+        }
+        const grokBot = await fetchSandQuota(stored.apiKey).catch(() => ({ available: false as const }));
+        if (rawProfile === "sand" && !grokBot.available) {
+          throw invalidRequest("Sand is unavailable until Grok Bot access is granted");
+        }
+        const updated = accounts.setDefaultProfile(id, rawProfile);
+        if (!updated) throw notFound("Persistent account was not found");
+        sendJson(res, 200, {
+          ...publicAccount(updated),
+          account: await accountPayload(updated.apiKey, updated.defaultProfile),
+        }, requestId);
+        return;
       }
 
       if (path === "/v0/management/accounts") {
@@ -436,11 +538,7 @@ export function createApp(input: {
             res,
             200,
             {
-              accounts: accounts.list().map((account) => ({
-                id: account.id,
-                key_hint: account.keyHint,
-                added_at: account.addedAt,
-              })),
+              accounts: accounts.list().map(publicAccount),
             },
             requestId,
           );
@@ -455,11 +553,7 @@ export function createApp(input: {
             res,
             201,
             {
-              account: {
-                id: account.id,
-                key_hint: account.keyHint,
-                added_at: account.addedAt,
-              },
+              account: publicAccount(account),
             },
             requestId,
           );
@@ -507,7 +601,7 @@ export function createApp(input: {
       if (method === "GET" && path === "/v1/account") {
         const client = authorizeClient(req, config);
         if (client.mode === "byok") {
-          const account = await readAccount(sdk, client.auth.cursorApiKey);
+          const account = await accountPayload(client.auth.cursorApiKey);
           sendJson(res, 200, account, requestId);
         } else {
           const configured = accounts.list();
@@ -515,7 +609,7 @@ export function createApp(input: {
             configured.map(async (account) => ({
               id: account.id,
               key_hint: account.keyHint,
-              account: await readAccount(sdk, account.apiKey),
+              account: await accountPayload(account.apiKey, account.defaultProfile),
             })),
           );
           sendJson(res, 200, { pool: true, account_count: details.length, accounts: details }, requestId);
@@ -567,18 +661,82 @@ export function createApp(input: {
         const client = authorizeClient(req, config);
         const body = await readJsonBody(req, config.maxBodyBytes);
         if (body === undefined) throw invalidRequest("JSON body is required");
-        const responses = parseResponsesRequest(body);
+        const responses = parseResponsesRequest(body, {
+          hostedSearchMode: config.runtimePolicy.hostedSearchMode,
+        });
         const sessionHint = headerValue(req, "x-cursor-session-id");
-        await runWithProviderRecovery(res, client, responses.parsed, sessionHint, (auth) =>
-          coordinator.handleMessages(
+        if (responses.compaction.trigger) {
+          const auth = await resolveAuth(client, responses.parsed, sessionHint);
+          const minted = mintLocalCompact({
+            store: compactStore,
+            account: auth.fingerprint,
+            profile: runtimeProfileFor(req, client, auth),
+            parsed: responses,
+            sessionHint,
+          });
+          writeLocalCompactResponse({
+            res,
+            clock,
+            requestId,
+            stream: responses.parsed.stream,
+            model: responses.parsed.model,
+            token: minted.token,
+            compactId: minted.record.compactId,
+            sessionId: sessionHint,
+          });
+          return;
+        }
+        await runWithProviderRecovery(res, client, responses.parsed, sessionHint, (auth) => {
+          let hint = sessionHint;
+          if (responses.compaction.encryptedContent) {
+            const bound = bindCompactContinuation({
+              store: compactStore,
+              token: responses.compaction.encryptedContent,
+              account: auth.fingerprint,
+              profile: runtimeProfileFor(req, client, auth),
+              parsed: responses,
+            });
+            hint = sessionHint ?? bound.sessionId;
+          }
+          return coordinator.handleMessages(
             req,
             res,
             auth,
             responses.parsed,
             requestId,
-            sessionHint,
+            hint,
             createResponsesWriterFactory(),
-          ));
+          );
+        });
+        return;
+      }
+
+      if (method === "POST" && path === "/v1/responses/compact") {
+        const client = authorizeClient(req, config);
+        const body = await readJsonBody(req, config.maxBodyBytes);
+        if (body === undefined) throw invalidRequest("JSON body is required");
+        const responses = parseResponsesRequest(body, {
+          hostedSearchMode: config.runtimePolicy.hostedSearchMode,
+        });
+        const sessionHint = headerValue(req, "x-cursor-session-id");
+        const auth = await resolveAuth(client, responses.parsed, sessionHint);
+        const minted = mintLocalCompact({
+          store: compactStore,
+          account: auth.fingerprint,
+          profile: runtimeProfileFor(req, client, auth),
+          parsed: responses,
+          sessionHint,
+        });
+        writeLocalCompactResponse({
+          res,
+          clock,
+          requestId,
+          stream: responses.parsed.stream,
+          model: responses.parsed.model,
+          token: minted.token,
+          compactId: minted.record.compactId,
+          sessionId: sessionHint,
+        });
         return;
       }
 
@@ -598,12 +756,12 @@ export function createApp(input: {
       if (res.writableEnded || res.destroyed) return;
       if (res.headersSent) {
         if (path === "/v1/chat/completions") writeChatStreamError(res, error, requestId);
-        else if (path === "/v1/responses") writeResponsesStreamError(res, error, requestId);
+        else if (path === "/v1/responses" || path === "/v1/responses/compact") writeResponsesStreamError(res, error, requestId);
         else writeSseError(res, toPublicErrorBody(error, requestId));
         res.end();
         return;
       }
-      if (path === "/v1/chat/completions" || path === "/v1/responses") sendOpenAIError(res, error, requestId);
+      if (path === "/v1/chat/completions" || path === "/v1/responses" || path === "/v1/responses/compact") sendOpenAIError(res, error, requestId);
       else sendError(res, error, requestId);
     }
   };
@@ -617,6 +775,8 @@ export function createApp(input: {
     ordinaryJournal,
     accounts,
     sdk,
+    ledger,
+    sandHealth,
     handler,
     listen() {
       const server = createServer((req, res) => {
@@ -629,6 +789,9 @@ export function createApp(input: {
       shuttingDown = true;
       clearInterval(sweepTimer);
       registry.beginShutdown();
+    },
+    close() {
+      ledger?.close();
     },
   };
 }

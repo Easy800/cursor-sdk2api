@@ -1,11 +1,19 @@
 import { existsSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  loadRuntimePolicyFromEnv,
+  parseRuntimeLedgerV2,
+  type RuntimePolicy,
+} from "./core/runtime-profile.js";
 import { instanceId } from "./ids.js";
 import { resolveOutboundProxy } from "./sdk/proxy.js";
 
 export type AuthMode = "byok" | "managed";
+
+const PACKAGE_VERSION = (createRequire(import.meta.url)("../package.json") as { version: string }).version;
 
 export interface GatewayConfig {
   host: string;
@@ -36,6 +44,8 @@ export interface GatewayConfig {
   agentTransport: "http1-proxy" | "http2-direct";
   fetchTransport: "undici-proxy" | "fetch-direct";
   capabilities: RuntimeCapabilities;
+  runtimePolicy: RuntimePolicy;
+  runtimeLedgerV2: boolean;
 }
 
 export interface RuntimeCapabilities {
@@ -118,7 +128,7 @@ export function loadConfig(overrides: Partial<GatewayConfig> = {}): GatewayConfi
     managedCursorKey: process.env.CURSOR_API_KEY || undefined,
     gatewayAccessKey: process.env.GATEWAY_ACCESS_KEY || undefined,
     instanceId: instanceId(process.env.INSTANCE_ID),
-    version: process.env.GATEWAY_VERSION?.trim() || "0.1.0",
+    version: process.env.GATEWAY_VERSION?.trim() || PACKAGE_VERSION,
     sdkVersion: "1.0.30",
     globalActiveRuns: envInt("GLOBAL_ACTIVE_RUNS", 4),
     perCredentialActiveRuns: envInt("PER_CREDENTIAL_ACTIVE_RUNS", 2),
@@ -143,6 +153,8 @@ export function loadConfig(overrides: Partial<GatewayConfig> = {}): GatewayConfi
     agentTransport: proxyConfigured ? "http1-proxy" : "http2-direct",
     fetchTransport: proxyConfigured ? "undici-proxy" : "fetch-direct",
     capabilities: { ...DEFAULT_CAPABILITIES },
+    runtimePolicy: loadRuntimePolicyFromEnv(),
+    runtimeLedgerV2: parseRuntimeLedgerV2(),
   };
 
   if (authMode === "managed") {

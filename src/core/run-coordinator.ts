@@ -7,6 +7,7 @@ import type { AuthContext } from "../auth/credentials.js";
 import { digestJson } from "../digest.js";
 import {
   GatewayError,
+  forbiddenError,
   invalidRequest,
   sdkFailure,
   sessionConflict,
@@ -31,15 +32,25 @@ import { decideOrdinaryTurn } from "./ordinary-turn.js";
 import type { OrdinaryTurnJournal, OrdinaryTurnRecord } from "./ordinary-turn-journal.js";
 import { Session } from "./session.js";
 import { SessionRegistry } from "./session-registry.js";
-import { SdkRunDriver, type SdkAgentSource } from "./sdk-run-driver.js";
+import { SdkRunDriver, type DriveSdkRunInput, type SdkAgentSource } from "./sdk-run-driver.js";
 import { batchDigest } from "./tool-bridge.js";
 import { buildTranscriptRecovery } from "./transcript-recovery.js";
 import type { LineageRecord, LineageStore } from "./lineage-store.js";
+import type { RuntimeLedger } from "./runtime-ledger.js";
+import {
+  DEFAULT_RUNTIME_PROFILE,
+  resolveRequestProfile,
+  type RuntimeProfile,
+} from "./runtime-profile.js";
 import type { TurnWriter, TurnWriterFactory, TurnWriterSession } from "./turn-writer.js";
 import {
   executableToolCatalogFingerprint,
   sessionPolicyFingerprintFromParsed,
 } from "./session-policy.js";
+import { toLedgerUsage } from "./usage.js";
+import { headerValue } from "../server/http-util.js";
+import type { SandLoaderHealth } from "../sdk/sand-loader.js";
+import { sandWorkspaceDir } from "../sdk/sand-paths.js";
 
 interface OrdinaryReplayEntry {
   turn: NonNullable<Session["replay"]>["turn"];
@@ -63,6 +74,9 @@ export interface CoordinatorDeps {
   workspaceDir: string;
   lineage?: LineageStore;
   ordinaryJournal?: OrdinaryTurnJournal;
+  ledger?: RuntimeLedger;
+  sandHealth?: SandLoaderHealth;
+  assertSandAccess?: (apiKey: string) => Promise<void>;
   /** Test-only gate between waitForBoundary and state transition. */
   beforeApplyBoundary?: (boundary: PumpBoundary) => Promise<void>;
 }
@@ -143,7 +157,10 @@ export class RunCoordinator {
       await this.continueTurn(req, res, auth, parsed, parsed.continuation, requestId, writerFactory);
       return;
     }
-    const turn = cursorAgentTurnFromParsed(parsed, { tenantScope: auth.fingerprint });
+    const turn = cursorAgentTurnFromParsed(parsed, {
+      tenantScope: auth.fingerprint,
+      runtimeProfile: this.requestProfile(req, auth),
+    });
     if (this.deps.config.ordinaryTurnCoordinator && this.deps.ordinaryJournal) {
       const handled = await this.handleOrdinaryTurn(
         req,
@@ -190,6 +207,9 @@ export class RunCoordinator {
     const journal = this.deps.ordinaryJournal;
     if (!journal) return false;
     const key = ordinaryReplayKey(turn);
+    if (await this.tryReconnectLogicalRun(req, res, parsed, requestId, writerFactory, key)) {
+      return true;
+    }
     const inflight = this.ordinaryInflight.get(key);
     if (inflight) {
       await inflight;
@@ -419,8 +439,10 @@ export class RunCoordinator {
     if (parent.sessionPolicyFingerprint !== turn.lineage.sessionPolicyFingerprint) {
       throw sessionConflict("session policy does not match the ordinary-turn owner");
     }
+    const profile = this.requestProfile(req, auth);
     this.deps.registry.assertCanActivateRun({
       credentialFingerprint: auth.fingerprint,
+      runtimeProfile: profile,
     });
     const session = this.deps.registry.create({
       credentialFingerprint: auth.fingerprint,
@@ -428,6 +450,7 @@ export class RunCoordinator {
       modelParams: parsed.modelParams,
       sessionPolicyFingerprint: turn.lineage.sessionPolicyFingerprint,
       executableToolCatalogFingerprint: executableToolCatalogFingerprint(parsed.tools),
+      runtimeProfile: profile,
     });
     session.ordinaryReplayOwner = turn;
     await this.followUp(
@@ -444,7 +467,7 @@ export class RunCoordinator {
           type: "resume",
           agentId: parent.agentId,
           apiKey: auth.cursorApiKey,
-          workspaceDir: this.deps.workspaceDir,
+          workspaceDir: this.workspaceFor(profile),
         },
         afterAgentReady: () => {
           this.traceOrdinary({
@@ -547,22 +570,36 @@ export class RunCoordinator {
     ordinaryTurn?: CursorAgentTurn,
     sendOverride?: { text: string; images: Array<{ data: string; mimeType: string }> },
   ): Promise<void> {
+    const logicalKey = ordinaryTurn
+      ? ordinaryReplayKey(ordinaryTurn)
+      : this.logicalKeyFor(auth, parsed);
+    if (await this.tryReconnectLogicalRun(req, res, parsed, requestId, writerFactory, logicalKey)) {
+      return;
+    }
+    const profile = this.requestProfile(req, auth);
     const session = this.deps.registry.create({
       credentialFingerprint: auth.fingerprint,
       modelId: parsed.model,
       modelParams: parsed.modelParams,
-      sessionPolicyFingerprint: sessionPolicyFingerprintFromParsed(parsed),
+      sessionPolicyFingerprint: sessionPolicyFingerprintFromParsed(parsed, parsed.modelParams, profile),
       executableToolCatalogFingerprint: executableToolCatalogFingerprint(parsed.tools),
+      runtimeProfile: profile,
     });
+    session.logicalKey = logicalKey;
+    session.runtimeProfile = profile;
+    session.hostedSearch = parsed.hostedSearch === true;
     if (ordinaryTurn) session.ordinaryReplayOwner = ordinaryTurn;
     try {
       const prompt = sendOverride ?? renderPrompt(parsed);
-      const pump = await this.sdkRunDriver.start({
-        session,
-        tools: parsed.tools,
-        agent: { type: "create", apiKey: auth.cursorApiKey, workspaceDir: this.deps.workspaceDir },
-        send: prompt,
-      });
+      const pump = await this.startAndBind(
+        {
+          session,
+          tools: parsed.tools,
+          agent: { type: "create", apiKey: auth.cursorApiKey, workspaceDir: this.workspaceFor(profile) },
+          send: prompt,
+        },
+        logicalKey,
+      );
       session.state = "running";
       await this.drive(req, res, session, pump, parsed.stream, requestId, writerFactory);
     } catch (error) {
@@ -583,7 +620,11 @@ export class RunCoordinator {
     writerFactory: TurnWriterFactory,
     options: FollowUpOptions = {},
   ): Promise<void> {
-    this.assertIdentity(session, auth, parsed);
+    this.assertIdentity(req, session, auth, parsed);
+    const logicalKey = this.logicalKeyFor(auth, parsed);
+    if (await this.tryReconnectLogicalRun(req, res, parsed, requestId, writerFactory, logicalKey)) {
+      return;
+    }
     const agentSource = options.agent ?? (session.agent
       ? { type: "existing" as const, agent: session.agent }
       : undefined);
@@ -608,13 +649,16 @@ export class RunCoordinator {
     session.appliedBoundaryId = undefined;
     const prompt = options.send ?? renderPrompt(parsed);
     try {
-      const pump = await this.sdkRunDriver.start({
-        session,
-        tools: parsed.tools,
-        agent: agentSource,
-        send: prompt,
-        afterAgentReady: options.afterAgentReady,
-      });
+      const pump = await this.startAndBind(
+        {
+          session,
+          tools: parsed.tools,
+          agent: agentSource,
+          send: prompt,
+          afterAgentReady: options.afterAgentReady,
+        },
+        logicalKey,
+      );
       await this.drive(req, res, session, pump, parsed.stream, requestId, writerFactory);
     } catch (error) {
       if (!res.headersSent) this.deps.registry.forget(session, options.failureReason ?? "follow_up_failed");
@@ -714,7 +758,7 @@ export class RunCoordinator {
   ): Promise<void> {
     const ids = results.map((result) => result.toolUseId);
     this.deps.registry.requireLive(session, ids);
-    this.assertPendingIdentity(session, auth, parsed);
+    this.assertPendingIdentity(req, session, auth, parsed);
 
     const digest = batchDigest(results);
     if (session.lastResultDigest && session.lastResultDigest !== digest) {
@@ -764,6 +808,7 @@ export class RunCoordinator {
           : result.content,
       );
     }
+    this.persistLedgerToolResults(session, results);
     await drive;
   }
 
@@ -813,23 +858,29 @@ export class RunCoordinator {
     results: ParsedToolResult[],
     recovery: ReturnType<typeof buildTranscriptRecovery>,
   ): Promise<{ session: Session; pump: EventPump }> {
+    const profile = this.requestProfileFromAuth(auth);
     const session = this.deps.registry.create({
       credentialFingerprint: auth.fingerprint,
       modelId: parsed.model,
       modelParams: parsed.modelParams,
-      sessionPolicyFingerprint: sessionPolicyFingerprintFromParsed(parsed),
+      sessionPolicyFingerprint: sessionPolicyFingerprintFromParsed(parsed, parsed.modelParams, profile),
       executableToolCatalogFingerprint: executableToolCatalogFingerprint(parsed.tools),
+      runtimeProfile: profile,
     });
+    session.hostedSearch = parsed.hostedSearch === true;
     this.beginOrdinaryReplaySegment(session, auth, parsed);
     session.lastResultDigest = batchDigest(results);
     try {
-      const pump = await this.sdkRunDriver.start({
-        session,
-        tools: parsed.tools,
-        agent: { type: "create", apiKey: auth.cursorApiKey, workspaceDir: this.deps.workspaceDir },
-        send: { text: recovery.prompt, images: parsed.images },
-        completedResults: recovery.completedResults,
-      });
+      const pump = await this.startAndBind(
+        {
+          session,
+          tools: parsed.tools,
+          agent: { type: "create", apiKey: auth.cursorApiKey, workspaceDir: this.workspaceFor(profile) },
+          send: { text: recovery.prompt, images: parsed.images },
+          completedResults: recovery.completedResults,
+        },
+        this.logicalKeyFor(auth, parsed),
+      );
       session.state = "running";
       return { session, pump };
     } catch (error) {
@@ -900,7 +951,11 @@ export class RunCoordinator {
     record: LineageRecord,
     digest: string,
   ): Promise<{ session: Session; pump: EventPump }> {
-    this.deps.registry.assertCanActivateRun({ credentialFingerprint: record.credentialFingerprint });
+    const boundProfile = record.runtimeProfile ?? DEFAULT_RUNTIME_PROFILE;
+    this.deps.registry.assertCanActivateRun({
+      credentialFingerprint: record.credentialFingerprint,
+      runtimeProfile: boundProfile,
+    });
     const session = new Session({
       sessionId: record.sessionId,
       credentialFingerprint: record.credentialFingerprint,
@@ -910,6 +965,7 @@ export class RunCoordinator {
       executableToolCatalogFingerprint: record.executableToolCatalogFingerprint,
       instanceId: this.deps.registry.instanceId,
       clock: this.deps.clock,
+      runtimeProfile: boundProfile,
     });
     session.state = "resuming";
     this.beginOrdinaryReplaySegment(session, auth, parsed);
@@ -917,17 +973,20 @@ export class RunCoordinator {
     this.deps.registry.adopt(session);
 
     try {
-      const pump = await this.sdkRunDriver.start({
-        session,
-        tools: parsed.tools,
-        agent: {
-          type: "resume",
-          agentId: record.sdkAgentId,
-          apiKey: auth.cursorApiKey,
-          workspaceDir: this.deps.workspaceDir,
+      const pump = await this.startAndBind(
+        {
+          session,
+          tools: parsed.tools,
+          agent: {
+            type: "resume",
+            agentId: record.sdkAgentId,
+            apiKey: auth.cursorApiKey,
+            workspaceDir: this.workspaceFor(boundProfile),
+          },
+          send: { text: recoveredToolResultPrompt(record, results), force: true },
         },
-        send: { text: recoveredToolResultPrompt(record, results), force: true },
-      });
+        this.logicalKeyFor(auth, parsed),
+      );
       for (const id of record.pendingToolIds) this.deps.registry.indexTool(id, session.sessionId);
       return { session, pump };
     } catch (error) {
@@ -1015,8 +1074,14 @@ export class RunCoordinator {
         }
       }
       this.persistLineage(session);
+      this.persistLedgerBoundary(session, boundary);
     }
     if (boundary.type === "error") {
+      try {
+        writer.fail(boundary.error);
+      } catch {
+        // client may already be gone
+      }
       throw boundary.error;
     }
     try {
@@ -1042,8 +1107,9 @@ export class RunCoordinator {
     if (record.credentialFingerprint !== auth.fingerprint || record.modelId !== parsed.model) {
       throw sessionConflict("credential or model does not match the stored session");
     }
+    const boundProfile = record.runtimeProfile ?? DEFAULT_RUNTIME_PROFILE;
     const effectiveParams = parsed.modelParams.length > 0 ? parsed.modelParams : record.modelParams ?? [];
-    if (record.sessionPolicyFingerprint !== sessionPolicyFingerprintFromParsed(parsed, effectiveParams)) {
+    if (record.sessionPolicyFingerprint !== sessionPolicyFingerprintFromParsed(parsed, effectiveParams, boundProfile)) {
       throw sessionConflict("session policy does not match the stored session");
     }
     if (parsed.modelParams.length > 0 && !sameModelParams(record.modelParams ?? [], parsed.modelParams)) {
@@ -1054,6 +1120,7 @@ export class RunCoordinator {
     }
     this.deps.registry.assertCanActivateRun({
       credentialFingerprint: record.credentialFingerprint,
+      runtimeProfile: boundProfile,
     });
     const session = new Session({
       sessionId: record.sessionId,
@@ -1064,6 +1131,7 @@ export class RunCoordinator {
       executableToolCatalogFingerprint: record.executableToolCatalogFingerprint,
       instanceId: this.deps.registry.instanceId,
       clock: this.deps.clock,
+      runtimeProfile: boundProfile,
     });
     this.deps.registry.adopt(session);
     await this.followUp(req, res, auth, parsed, session, requestId, writerFactory, {
@@ -1071,13 +1139,16 @@ export class RunCoordinator {
         type: "resume",
         agentId: record.sdkAgentId,
         apiKey: auth.cursorApiKey,
-        workspaceDir: this.deps.workspaceDir,
+        workspaceDir: this.workspaceFor(boundProfile),
       },
       failureReason: "resume_failed",
     });
   }
 
   private persistLineage(session: Session): void {
+    // Dual-write: lineage JSON is still written this round so v0.3.2 recovery
+    // keeps working. SQLite is the claim/receipt owner when runtimeLedgerV2 is
+    // on. Removing JSON as a mutating truth source is a later version.
     if (!this.deps.lineage) return;
     const persistable =
       session.state === "completed" || session.state === "awaiting_tool_results" || session.state === "failed";
@@ -1095,6 +1166,7 @@ export class RunCoordinator {
       ...(session.modelParams.length > 0 ? { modelParams: session.modelParams } : {}),
       sessionPolicyFingerprint: session.sessionPolicyFingerprint,
       executableToolCatalogFingerprint: session.executableToolCatalogFingerprint,
+      runtimeProfile: session.runtimeProfile,
       state: session.state as LineageRecord["state"],
       pendingToolIds:
         session.state === "awaiting_tool_results" ? [...session.pending.keys()] : [],
@@ -1150,27 +1222,32 @@ export class RunCoordinator {
     }
     session.ordinaryReplayOwner = cursorAgentTurnFromParsed(parsed, {
       tenantScope: auth.fingerprint,
+      runtimeProfile: session.runtimeProfile,
     });
   }
 
   private assertIdentity(
+    req: IncomingMessage,
     session: Session,
     auth: AuthContext,
     parsed: ParsedMessages,
   ): void {
     this.assertModelIdentity(session, auth, parsed);
+    this.assertBoundProfile(req, session);
     const effectiveParams = parsed.modelParams.length > 0 ? parsed.modelParams : session.modelParams;
-    if (session.sessionPolicyFingerprint !== sessionPolicyFingerprintFromParsed(parsed, effectiveParams)) {
+    if (session.sessionPolicyFingerprint !== sessionPolicyFingerprintFromParsed(parsed, effectiveParams, session.runtimeProfile)) {
       throw sessionConflict("session policy does not match the session owner");
     }
   }
 
   private assertPendingIdentity(
+    req: IncomingMessage,
     session: Session,
     auth: AuthContext,
     parsed: ParsedMessages,
   ): void {
     this.assertModelIdentity(session, auth, parsed);
+    this.assertBoundProfile(req, session);
     if (
       parsed.tools.length > 0 &&
       session.executableToolCatalogFingerprint !== executableToolCatalogFingerprint(parsed.tools)
@@ -1198,6 +1275,256 @@ export class RunCoordinator {
     }
   }
 
+  private ledgerEnabled(): boolean {
+    return Boolean(this.deps.config.runtimeLedgerV2 && this.deps.ledger);
+  }
+
+  private runIsBound(session: Session): boolean {
+    return Boolean(session.run || session.ledgerRunId);
+  }
+
+  private logicalKeyFor(auth: AuthContext, parsed: ParsedMessages): string {
+    return ordinaryReplayKey(cursorAgentTurnFromParsed(parsed, {
+      tenantScope: auth.fingerprint,
+      runtimeProfile: this.requestProfileFromAuth(auth),
+    }));
+  }
+
+  private findSessionByLogicalKey(logicalKey: string): Session | undefined {
+    for (const session of this.deps.registry.sessions.values()) {
+      if (session.logicalKey === logicalKey) return session;
+    }
+    return undefined;
+  }
+
+  private async startAndBind(input: DriveSdkRunInput, logicalKey: string): Promise<EventPump> {
+    input.session.logicalKey = logicalKey;
+    await this.ensureSandRun(input);
+    const pump = await this.sdkRunDriver.start(input);
+    this.bindLedgerAfterSend(input.session, logicalKey);
+    return pump;
+  }
+
+  private requestProfile(req: IncomingMessage, auth: AuthContext): RuntimeProfile {
+    return resolveRequestProfile({
+      header: headerValue(req, "x-cursor-runtime-profile"),
+      policy: this.deps.config.runtimePolicy,
+      authMode: auth.mode,
+      accountDefaultProfile: auth.defaultProfile,
+    });
+  }
+
+  private requestProfileFromAuth(auth: AuthContext): RuntimeProfile {
+    return resolveRequestProfile({
+      policy: this.deps.config.runtimePolicy,
+      authMode: auth.mode,
+      accountDefaultProfile: auth.defaultProfile,
+    });
+  }
+
+  private assertBoundProfile(req: IncomingMessage, session: Session): void {
+    const header = headerValue(req, "x-cursor-runtime-profile")?.trim();
+    if (!header || !this.deps.config.runtimePolicy.allowRequestOverride) return;
+    const requested = resolveRequestProfile({
+      header,
+      policy: this.deps.config.runtimePolicy,
+      authMode: "byok",
+    });
+    if (requested !== session.runtimeProfile) {
+      throw sessionConflict("runtime profile does not match the session owner");
+    }
+  }
+
+  private workspaceFor(profile: RuntimeProfile): string {
+    if (profile === "sand") return sandWorkspaceDir(this.deps.config.stateDir);
+    return this.deps.workspaceDir;
+  }
+
+  private async ensureSandRun(input: DriveSdkRunInput): Promise<void> {
+    if (input.session.runtimeProfile !== "sand") return;
+    if (this.deps.sandHealth && !this.deps.sandHealth.ready) {
+      throw forbiddenError("Sand runtime is not ready");
+    }
+    const apiKey = input.agent.type === "existing" ? undefined : input.agent.apiKey;
+    if (!apiKey || !this.deps.assertSandAccess) return;
+    await this.deps.assertSandAccess(apiKey);
+  }
+
+  private bindLedgerAfterSend(session: Session, logicalKey: string): void {
+    if (!this.ledgerEnabled()) return;
+    const ledger = this.deps.ledger!;
+    const sdkAgentId = session.sdkAgentId ?? session.agent?.agentId;
+    if (!sdkAgentId || !logicalKey) return;
+    try {
+      const agent = ledger.upsertAgent({
+        credentialFingerprint: session.credentialFingerprint,
+        runtimeProfile: session.runtimeProfile,
+        sdkAgentId,
+        model: session.modelId,
+        policyDigest: session.sessionPolicyFingerprint,
+      });
+      const claimed = ledger.claimRun({
+        agentId: agent.id,
+        logicalKey,
+        runtimeProfile: session.runtimeProfile,
+        generation: session.ledgerGeneration,
+        sdkRunId: session.run?.id,
+      });
+      session.logicalKey = logicalKey;
+      session.ledgerRunId = claimed.run.id;
+      session.ledgerGeneration = claimed.run.generation;
+      const offset = session.run?.id ?? session.sessionId;
+      ledger.persistObserveOffset(claimed.run.id, offset, claimed.run.generation);
+    } catch {
+      this.deps.logger.warn({ session_id: session.sessionId }, "runtime ledger claim failed");
+    }
+  }
+
+  private reconnectClaim(session: Session): void {
+    if (!this.ledgerEnabled() || !session.logicalKey) return;
+    const ledger = this.deps.ledger!;
+    const run = session.ledgerRunId
+      ? ledger.getRun(session.ledgerRunId)
+      : ledger.getRunByLogicalKey(session.logicalKey);
+    if (!run) return;
+    try {
+      const claimed = ledger.claimRun({
+        agentId: run.agentId,
+        logicalKey: run.logicalKey,
+        runtimeProfile: run.runtimeProfile,
+        generation: run.generation,
+        sdkRunId: run.sdkRunId,
+      });
+      session.ledgerRunId = claimed.run.id;
+      session.ledgerGeneration = claimed.run.generation;
+    } catch {
+      this.deps.logger.warn({ session_id: session.sessionId }, "runtime ledger reconnect claim failed");
+    }
+  }
+
+  private async tryReconnectLogicalRun(
+    req: IncomingMessage,
+    res: ServerResponse,
+    parsed: ParsedMessages,
+    requestId: string,
+    writerFactory: TurnWriterFactory,
+    logicalKey: string,
+  ): Promise<boolean> {
+    if (!this.ledgerEnabled() || !logicalKey) return false;
+    const live = this.findSessionByLogicalKey(logicalKey);
+    if (
+      live?.pump &&
+      (live.state === "running" || live.state === "resuming" || live.state === "creating")
+    ) {
+      this.reconnectClaim(live);
+      await this.drive(req, res, live, live.pump, parsed.stream, requestId, writerFactory);
+      return true;
+    }
+    if (live?.replay && (live.state === "completed" || live.state === "awaiting_tool_results")) {
+      this.reconnectClaim(live);
+      this.writeReplay(
+        res,
+        { turn: live.replay.turn, writerSession: live },
+        parsed.stream,
+        requestId,
+        writerFactory,
+      );
+      return true;
+    }
+    const run = this.deps.ledger!.getRunByLogicalKey(logicalKey);
+    if (!run) return false;
+    if (run.state === "running" || run.state === "awaiting_tool_results") {
+      try {
+        this.deps.ledger!.claimRun({
+          agentId: run.agentId,
+          logicalKey: run.logicalKey,
+          runtimeProfile: run.runtimeProfile,
+          generation: run.generation,
+          sdkRunId: run.sdkRunId,
+        });
+      } catch {
+        this.deps.logger.warn({ session_id: live?.sessionId }, "runtime ledger reconnect without live owner");
+      }
+      throw sessionLost("bound run is not live in this process");
+    }
+    return false;
+  }
+
+  private persistLedgerBoundary(session: Session, boundary: PumpBoundary): void {
+    if (!this.ledgerEnabled() || !session.ledgerRunId) return;
+    const ledger = this.deps.ledger!;
+    const runId = session.ledgerRunId;
+    const generation = session.ledgerGeneration;
+    try {
+      if (boundary.type === "tools") {
+        ledger.persistObserveOffset(runId, boundary.turn.messageId, generation);
+        for (const call of session.pending.values()) {
+          ledger.recordInteractionDigests({
+            runId,
+            generation,
+            toolCallId: call.toolUseId,
+            toolName: call.name,
+            argsDigest: digestJson(call.input ?? {}),
+            state: "pending",
+          });
+        }
+        return;
+      }
+      if (boundary.type === "final") {
+        ledger.persistObserveOffset(runId, boundary.turn.messageId, generation);
+        const usage = toLedgerUsage(boundary.turn.usage) ?? { inputTokens: 0, outputTokens: 0 };
+        ledger.finalizeRunWithReceipt({
+          runId,
+          generation,
+          receiptId: `rct_${runId}`,
+          terminalDigest: digestJson({
+            kind: "final",
+            sessionId: session.sessionId,
+            messageId: boundary.turn.messageId,
+            stopReason: boundary.turn.stopReason,
+          }),
+          state: "finished",
+          usage,
+        });
+        return;
+      }
+      ledger.finalizeRunWithReceipt({
+        runId,
+        generation,
+        receiptId: `rct_${runId}`,
+        terminalDigest: digestJson({
+          kind: "error",
+          sessionId: session.sessionId,
+        }),
+        state: "error",
+      });
+    } catch {
+      this.deps.logger.warn({ session_id: session.sessionId }, "runtime ledger persist failed");
+    }
+  }
+
+  private persistLedgerToolResults(session: Session, results: ParsedToolResult[]): void {
+    if (!this.ledgerEnabled() || !session.ledgerRunId) return;
+    const ledger = this.deps.ledger!;
+    try {
+      for (const result of results) {
+        const pending = session.pending.get(result.toolUseId);
+        if (!pending) continue;
+        ledger.recordInteractionDigests({
+          runId: session.ledgerRunId,
+          generation: session.ledgerGeneration,
+          toolCallId: result.toolUseId,
+          toolName: pending.name,
+          argsDigest: digestJson(pending.input ?? {}),
+          resultDigest: pending.resultDigest,
+          state: "acknowledged",
+        });
+      }
+    } catch {
+      this.deps.logger.warn({ session_id: session.sessionId }, "runtime ledger interaction persist failed");
+    }
+  }
+
   private watchDisconnect(
     req: IncomingMessage,
     res: ServerResponse,
@@ -1207,6 +1534,7 @@ export class RunCoordinator {
     const onClientGone = () => {
       session.pump?.detach(writer);
       if (res.writableEnded) return;
+      if (this.ledgerEnabled() && this.runIsBound(session)) return;
       if (!session.hasSemanticOutput && (session.state === "running" || session.state === "creating")) {
         void this.cancel(session, "client_closed_before_output");
       }

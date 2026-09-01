@@ -33,6 +33,7 @@ test("health reports runtime capability truth without account data", async () =>
   const body = (await res.json()) as {
     status: string;
     service: string;
+    version: string;
     sdk_version: string;
     runtime: string;
     network: { proxy_configured: boolean; agent_transport: string; fetch_transport: string };
@@ -41,6 +42,7 @@ test("health reports runtime capability truth without account data", async () =>
   };
   expect(body.status).toBe("ok");
   expect(body.service).toBe("cursor-sdk2api");
+  expect(body.version).toBe(ctx.app.config.version);
   expect(body.sdk_version).toBe("1.0.30");
   expect(body.runtime).toBe("local");
   expect(body.network).toEqual({
@@ -78,6 +80,13 @@ test("health reports runtime capability truth without account data", async () =>
   expect(body.verification).not.toHaveProperty("contract_tests");
   expect(JSON.stringify(body)).not.toContain("spending");
   expect(JSON.stringify(body)).not.toContain("email");
+  expect(JSON.stringify(body)).not.toMatch(/\/Users\/|node_modules|STATE_DIR|sand-sdk/);
+  const profiles = (body as { profiles?: { default?: string; sdk?: { ready?: boolean }; sand?: { ready?: boolean; sdk_version?: string; patch_contract_version?: string } } }).profiles;
+  expect(profiles?.default).toBe("sdk");
+  expect(profiles?.sdk?.ready).toBe(true);
+  expect(profiles?.sand?.sdk_version).toBe("1.0.30");
+  expect(profiles?.sand?.patch_contract_version).toBe("1.0.30");
+  expect(typeof profiles?.sand?.ready).toBe("boolean");
 });
 
 test("health capabilities follow runtime config, not marketing constants", async () => {
